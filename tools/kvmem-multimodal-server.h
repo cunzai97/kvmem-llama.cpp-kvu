@@ -185,7 +185,7 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
                 checkpoint.media_boundary = true;
                 multimodal_remember(st, std::move(checkpoint));
             }
-            const int rc = st.vision->decode(st.ctx, prompt, row, st.n_batch, dispatch);
+            const int rc = st.vision->decode(st.ctx, st.spec.ctx_dft, prompt, row, st.n_batch, dispatch);
             if (rc != 0) return rc;
             row = next;
             continue;

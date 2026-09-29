@@ -20,6 +20,7 @@
 namespace kvmem {
 
 class NvmeKvTier;
+class RawKvRamPool;
 class SnapshotWriter;
 class SnapshotReader;
 struct SnapshotBuffer;
@@ -32,6 +33,7 @@ struct RawKvStoreConfig {
     uint64_t k_row_bytes = 0;      // 0 = FP16 (n_embd_k * 2); else opaque K row
     uint64_t k_gpu_row_bytes = 0;  // 0 = no packed GPU K; else bytes per token row
     uint64_t v_gpu_row_bytes = 0;  // 0 = no packed GPU V; else bytes per token row
+    std::shared_ptr<RawKvRamPool> ram_pool; // optional, shared by all conversations; RAM only
     uint64_t nvme_bytes = 0;
     std::string nvme_dir;
     std::string nvme_file = "kvmem_raw_k.bin";
@@ -47,6 +49,21 @@ public:
 
     const RawKvStoreConfig &config() const { return cfg_; }
     bool nvme_enabled() const;
+
+    // New stores start pinned. A detached store may be unpinned, but an evicted
+    // store cannot be reactivated: no safe replay of its discarded KV exists.
+    void set_ram_pinned(bool pinned);
+    // Temporary read pin from branch planning through old-store detach and
+    // prefix publication; separate from active inference's residency pin.
+    void set_fork_pinned(bool pinned);
+    bool ram_evicted() const;
+    bool ram_recoverable_eviction() const; // false after allocation/write errors
+    // Only after a caller has verified every retained layer/row and its exact
+    // recurrent checkpoint. Drops the missing suffix and re-enables writes.
+    void recover_evicted_suffix(uint32_t keep_rows);
+    void mark_ram_unusable() noexcept; // failed multi-component recovery
+    bool ram_pool_enabled() const { return bool(cfg_.ram_pool); }
+    void reconcile_ram_budget();
 
     void ensure_blocks(uint32_t block_count);
 
@@ -70,6 +87,9 @@ public:
     bool has_k_gpu(uint32_t block_id, uint32_t il, uint32_t n = 1) const;
     bool has_v(uint32_t block_id, uint32_t il) const;
     bool has_v_gpu(uint32_t block_id, uint32_t il, uint32_t n = 1) const;
+    bool has_mean_k(uint32_t block_id, uint32_t il, uint32_t n) const;
+    // Opaque identity for diagnostics/tests; never dereference or persist it.
+    uintptr_t physical_page_id(uint32_t block_id) const;
     uint32_t n_tokens(uint32_t block_id) const;
 
     bool copy_k(uint32_t block_id, uint32_t il, float * out) const;
@@ -96,6 +116,12 @@ public:
 
     void wait_writes();
     void clear();
+    // Share only complete, all-layer packed 128-token blocks with an empty
+    // destination in the same RAM pool. Throws on incomplete/mismatched/NVMe
+    // stores. Subsequent writes detach the touched block (copy-on-write).
+    // require_mean=false is for the MTP follower: its mirror has packed KV but
+    // does not maintain the target model's mean-K retrieval index.
+    void clone_prefix_shared_to(RawKvStore & dst, uint32_t keep_rows, bool require_mean = true);
     // Preserve only the valid prefix, including a partial last block.
     void truncate_to(uint32_t token_pos);
     void invalidate_packed_from(uint32_t token_pos);
@@ -122,7 +148,8 @@ private:
         bool v_flushing = false;
     };
     struct BlockRaw {
-        std::vector<LayerBlk> layers;
+        std::shared_ptr<std::vector<LayerBlk>> layers = std::make_shared<std::vector<LayerBlk>>();
+        uint64_t ram_touch = 0;
     };
 
     uint32_t nvme_key(uint32_t block_id, uint32_t il, bool is_v) const;
@@ -152,7 +179,16 @@ private:
         std::vector<uint8_t> data;
     };
 
+    friend class RawKvRamPool;
+    void require_ram_intact() const; // caller holds mu_
+    void touch_ram(uint32_t block_id); // caller holds mu_
+    void detach_block(uint32_t block_id); // caller holds mu_; copy-on-write
+    size_t block_ram_bytes(const BlockRaw & b) const; // caller holds mu_
     RawKvStoreConfig cfg_;
+    bool ram_pinned_ = true;
+    uint32_t fork_pins_ = 0;
+    bool ram_evicted_ = false;
+    bool ram_poisoned_ = false; // not an ordinary whole-page pool eviction
     std::vector<BlockRaw> blocks_;
     std::unique_ptr<NvmeKvTier> nvme_;
     mutable std::vector<uint16_t> io_;
@@ -167,6 +203,25 @@ private:
     size_t inflight_ = 0;
     std::thread io_thread_;
     std::atomic<bool> stop_io_{false};
+};
+
+// One process-local pool; no text deduplication, disk backing or implicit
+// reconstruction. Eviction drops complete per-block K, V and mean statistics.
+class RawKvRamPool {
+public:
+    explicit RawKvRamPool(size_t limit_bytes) : limit_bytes_(limit_bytes) {}
+    RawKvRamPool(const RawKvRamPool &) = delete;
+    RawKvRamPool & operator=(const RawKvRamPool &) = delete;
+    void reconcile();
+    size_t used_bytes() const;
+    size_t limit_bytes() const { return limit_bytes_; }
+private:
+    friend class RawKvStore;
+    void attach(RawKvStore * store);
+    void detach(RawKvStore * store);
+    size_t limit_bytes_;
+    mutable std::mutex mu_; // lock order: pool.mu_ then store.mu_
+    std::vector<RawKvStore *> stores_;
 };
 
 } // namespace kvmem

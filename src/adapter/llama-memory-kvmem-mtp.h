@@ -77,6 +77,9 @@ public:
     // previous conversation's, so such a block is left out for as long as its
     // slot is tainted (see slot_tainted_ below).
     void follow_retrieval();
+    // Clone the source branch's packed draft prefix before publishing a fork.
+    // Throws if coverage or draft GPU restaging is incomplete.
+    void fork_prefix_from(kvmem::RawKvStore & source, uint32_t keep_rows);
     void detach_target() { target_ = nullptr; }
 
     // Retrieval layout: keep native MTP GPU KV for blocks that still sit

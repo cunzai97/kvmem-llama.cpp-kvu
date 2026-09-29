@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 
 kvmem_prompt::kvmem_prompt(const std::vector<llama_token> & input)
@@ -139,7 +140,7 @@ std::shared_ptr<kvmem_prompt> kvmem_vision::tokenize(const std::string & prompt,
     return std::make_shared<kvmem_prompt>(std::move(native));
 }
 
-int kvmem_vision::decode(llama_context * ctx, const kvmem_prompt & prompt, size_t row, int n_batch,
+int kvmem_vision::decode(llama_context * ctx, llama_context * ctx_dft, const kvmem_prompt & prompt, size_t row, int n_batch,
                        const std::function<int(llama_batch)> & dispatch) {
     const auto * chunk = prompt.chunk(row);
     const std::string id = mtmd_input_chunk_get_id(chunk);
@@ -156,6 +157,44 @@ int kvmem_vision::decode(llama_context * ctx, const kvmem_prompt & prompt, size_
             cache_.erase(victim);
         }
         const auto start = std::chrono::steady_clock::now();
+        using park_fn = bool (*)(int, size_t, bool);
+        park_fn park = nullptr;
+        const char * park_env = std::getenv("GGML_CUDA_VISION_PARK_MIB");
+        size_t park_bytes = 0;
+        if (park_env && std::string(park_env) != "0") {
+            char * end = nullptr;
+            const unsigned long long mib = std::strtoull(park_env, &end, 10);
+            if (!*park_env || *end || mib < 64 || mib > 8192) {
+                throw std::runtime_error("GGML_CUDA_VISION_PARK_MIB must be 64..8192 or 0");
+            }
+            const char * on_demand = std::getenv("MTMD_VISION_GPU_ON_DEMAND");
+            if (!on_demand || std::string(on_demand) != "1") {
+                throw std::runtime_error("CUDA vision weight parking requires MTMD_VISION_GPU_ON_DEMAND=1");
+            }
+            auto reg = ggml_backend_reg_by_name("CUDA");
+            if (reg) {
+                park = reinterpret_cast<park_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_vision_park"));
+            }
+            if (!park) throw std::runtime_error("CUDA backend lacks VMM vision weight parking support");
+            park_bytes = size_t(mib) * 1024 * 1024;
+            llama_synchronize(ctx);
+            if (ctx_dft) llama_synchronize(ctx_dft);
+            kvmem_diag("KVMEM_TRACE vision_weight_park begin mib=%llu target=%p draft=%p\n",
+                    mib, (void *) ctx, (void *) ctx_dft);
+            if (!park(0, park_bytes, true)) throw std::runtime_error("could not park CUDA language-model weights for vision encode");
+        }
+        struct restore_guard {
+            park_fn park;
+            bool active;
+            ~restore_guard() {
+                if (active) {
+                    if (!park(0, 0, false)) {
+                        GGML_ABORT("cannot restore parked CUDA weights after vision encode; refusing unsafe decode");
+                    }
+                    kvmem_diag("KVMEM_TRACE vision_weight_park restored\n");
+                }
+            }
+        } restore{park, park_bytes != 0};
         if (mtmd_encode_chunk(ctx_, chunk) != 0) throw std::runtime_error("vision encoder failed");
         ++encode_calls;
         encode_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();

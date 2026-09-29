@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 namespace {
@@ -29,6 +30,7 @@ uint64_t monotonic_ns() {
 
 namespace kvmem {
 namespace {
+std::atomic<uint64_t> ram_clock{1};
 
 uint16_t f32_to_f16(float f) {
     uint32_t x;
@@ -108,6 +110,9 @@ void unpack_f16(const uint16_t * src, float * dst, size_t n) {
 } // namespace
 
 RawKvStore::RawKvStore(RawKvStoreConfig cfg) : cfg_(std::move(cfg)) {
+    if (cfg_.ram_pool && cfg_.nvme_bytes)
+        throw std::runtime_error("RAM block pool rejects NVMe backing");
+    // Register after all potentially throwing NVMe initialization below.
 #if !KVMEM_ENABLE_NVME
     if (cfg_.nvme_bytes) throw std::runtime_error("NVMe offload is disabled in this build");
 #endif
@@ -137,9 +142,11 @@ RawKvStore::RawKvStore(RawKvStoreConfig cfg) : cfg_(std::move(cfg)) {
             }
         }
     }
+    if (cfg_.ram_pool) cfg_.ram_pool->attach(this);
 }
 
 RawKvStore::~RawKvStore() {
+    if (cfg_.ram_pool) cfg_.ram_pool->detach(this);
     stop_io_.store(true, std::memory_order_release);
     cv_.notify_all();
     if (io_thread_.joinable()) {
@@ -181,6 +188,214 @@ uint64_t RawKvStore::v_gpu_slot_bytes() const {
     return static_cast<uint64_t>(cfg_.block_tokens) * cfg_.v_gpu_row_bytes;
 }
 
+void RawKvStore::require_ram_intact() const {
+    if (ram_evicted_) throw std::runtime_error("RAM-only KV block was evicted; recompute unavailable");
+}
+
+void RawKvStore::touch_ram(uint32_t block_id) {
+    if (cfg_.ram_pool) blocks_[block_id].ram_touch = ram_clock.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RawKvStore::detach_block(uint32_t block_id) {
+    auto & payload = blocks_[block_id].layers;
+    if (payload.use_count() > 1) payload = std::make_shared<std::vector<LayerBlk>>(*payload);
+}
+
+size_t RawKvStore::block_ram_bytes(const BlockRaw & b) const {
+    size_t bytes = 0;
+    for (const auto & l : *b.layers)
+        bytes += l.k.capacity() + l.v.capacity()*sizeof(uint16_t) +
+                 l.k_gpu.capacity() + l.v_gpu.capacity() + l.k_sum.capacity()*sizeof(float);
+    return bytes;
+}
+
+void RawKvStore::set_ram_pinned(bool pinned) {
+    if (!cfg_.ram_pool) return;
+    {
+        std::lock_guard<std::mutex> pool_lk(cfg_.ram_pool->mu_);
+        std::lock_guard<std::mutex> lk(mu_);
+        // A discarded store may still be attached: the adapter turns it into
+        // a cache miss after switching payloads, then clears and rebuilds it.
+        ram_pinned_ = pinned;
+    }
+    // Trim even when the last active request exceeded the soft cap; the store
+    // is now detached and no longer contributes to the GPU working set.
+    if (!pinned) cfg_.ram_pool->reconcile();
+}
+
+void RawKvStore::set_fork_pinned(bool pinned) {
+    if (!cfg_.ram_pool) throw std::runtime_error("fork pin needs RAM pool");
+    {
+        std::lock_guard<std::mutex> pool_lk(cfg_.ram_pool->mu_);
+        std::lock_guard<std::mutex> lk(mu_);
+        if (pinned) {
+            require_ram_intact();
+            if (fork_pins_ == UINT32_MAX) throw std::runtime_error("too many fork pins");
+            ++fork_pins_;
+        } else if (fork_pins_ > 0) {
+            --fork_pins_;
+        }
+    }
+    if (!pinned) cfg_.ram_pool->reconcile();
+}
+
+bool RawKvStore::ram_evicted() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return ram_evicted_;
+}
+
+bool RawKvStore::ram_recoverable_eviction() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return ram_evicted_ && !ram_poisoned_;
+}
+
+bool RawKvStore::has_mean_k(uint32_t block_id, uint32_t il, uint32_t n) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (block_id >= blocks_.size() || il >= cfg_.n_layer) return false;
+    const auto & l = blocks_[block_id].layers->at(il);
+    return l.mean_tokens >= n && l.k_sum.size() == cfg_.n_embd_k;
+}
+
+void RawKvStore::mark_ram_unusable() noexcept {
+    std::lock_guard<std::mutex> lk(mu_);
+    ram_evicted_ = true;
+    ram_poisoned_ = true;
+}
+
+uintptr_t RawKvStore::physical_page_id(uint32_t block_id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return block_id < blocks_.size() ? reinterpret_cast<uintptr_t>(blocks_[block_id].layers.get()) : 0;
+}
+
+void RawKvStore::recover_evicted_suffix(uint32_t keep_rows) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!cfg_.ram_pool || !ram_evicted_ || ram_poisoned_ || !ram_pinned_ ||
+            !cfg_.block_tokens || keep_rows % cfg_.block_tokens != 0 ||
+            !keep_rows || keep_rows / cfg_.block_tokens >= blocks_.size())
+            throw std::runtime_error("unsafe RAM suffix recovery");
+        for (size_t id = 0; id < blocks_.size(); ++id) {
+            bool any = false;
+            for (const auto & l : *blocks_[id].layers) {
+                const bool populated = l.n_tokens || l.k_gpu_tokens || l.v_gpu_tokens ||
+                    l.mean_tokens || !l.k_gpu.empty() || !l.v_gpu.empty() || !l.k_sum.empty();
+                if (id >= keep_rows / cfg_.block_tokens) {
+                    if (populated) throw std::runtime_error("intact/partial suffix cannot be discarded");
+                } else if (populated) {
+                    any = true;
+                    if (l.k_gpu_tokens < cfg_.block_tokens || l.v_gpu_tokens < cfg_.block_tokens ||
+                        l.mean_tokens < cfg_.block_tokens || !l.k_gpu_fmt || !l.v_gpu_fmt ||
+                        l.k_gpu.size() < size_t(cfg_.block_tokens)*cfg_.k_gpu_row_bytes ||
+                        l.v_gpu.size() < size_t(cfg_.block_tokens)*cfg_.v_gpu_row_bytes ||
+                        l.k_sum.size() != cfg_.n_embd_k)
+                        throw std::runtime_error("retained prefix has incomplete KV/mean");
+                }
+            }
+            if (id < keep_rows / cfg_.block_tokens && !any)
+                throw std::runtime_error("retained prefix has a missing page");
+        }
+    }
+    // The adapter checks all layers before calling this, while the store is
+    // pinned. truncate_to waits for writers and does not mutate retained pages.
+    truncate_to(keep_rows);
+    std::lock_guard<std::mutex> lk(mu_);
+    ram_evicted_ = false;
+}
+
+void RawKvStore::reconcile_ram_budget() {
+    if (!cfg_.ram_pool) return;
+    try {
+        cfg_.ram_pool->reconcile();
+    } catch (...) {
+        // The just-written pinned block may be only partly updated; forbid a
+        // later request from treating this store as a usable KV authority.
+        std::lock_guard<std::mutex> lk(mu_);
+        ram_evicted_ = true;
+        ram_poisoned_ = true;
+        throw;
+    }
+}
+
+void RawKvRamPool::attach(RawKvStore * store) {
+    std::lock_guard<std::mutex> lk(mu_);
+    stores_.push_back(store);
+}
+
+void RawKvRamPool::detach(RawKvStore * store) {
+    std::lock_guard<std::mutex> lk(mu_);
+    stores_.erase(std::remove(stores_.begin(), stores_.end(), store), stores_.end());
+}
+
+size_t RawKvRamPool::used_bytes() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t total = 0;
+    std::unordered_map<const void *, bool> seen;
+    for (auto * store : stores_) {
+        std::lock_guard<std::mutex> slk(store->mu_);
+        for (const auto & b : store->blocks_) {
+            if (seen.emplace(b.layers.get(), true).second) total += store->block_ram_bytes(b);
+        }
+    }
+    return total;
+}
+
+void RawKvRamPool::reconcile() {
+    std::lock_guard<std::mutex> lk(mu_);
+    // Lock every attached store after pool.mu_, holding them through the
+    // decision and eviction. Shared physical pages may have pinned readers.
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(stores_.size());
+    for (auto * store : stores_) locks.emplace_back(store->mu_);
+    for (;;) {
+        struct Page { size_t bytes = 0; uint64_t newest = 0; uint32_t refs = 0; bool pinned = false; };
+        std::unordered_map<const void *, Page> pages;
+        size_t total = 0;
+        for (auto * store : stores_) for (const auto & b : store->blocks_) {
+            auto [it, inserted] = pages.emplace(b.layers.get(), Page{});
+            auto & page = it->second;
+            if (inserted) {
+                page.bytes = store->block_ram_bytes(b);
+                total += page.bytes;
+            }
+            page.newest = std::max(page.newest, b.ram_touch);
+            ++page.refs;
+            page.pinned |= store->ram_pinned_ || store->fork_pins_ != 0;
+        }
+        if (total <= limit_bytes_) return;
+        const void * victim = nullptr;
+        uint64_t oldest = UINT64_MAX;
+        uint32_t fewest_refs = UINT32_MAX;
+        for (const auto & entry : pages) {
+            const auto & page = entry.second;
+            // A cold, single-branch suffix is cheaper to discard than a
+            // shared prefix: evict pages with fewer live references first,
+            // then apply the existing LRU rule within that class.
+            if (page.bytes && !page.pinned &&
+                (page.refs < fewest_refs ||
+                 (page.refs == fewest_refs && page.newest < oldest))) {
+                fewest_refs = page.refs;
+                oldest = page.newest;
+                victim = entry.first;
+            }
+        }
+        // Pinned physical pages may exceed the soft cap until unpinned.
+        if (!victim) return;
+        if (std::getenv("KVMEM_TRACE")) {
+            const auto & selected = pages.at(victim);
+            std::fprintf(stderr, "KVMEM_TRACE ram_pool_evict bytes=%zu refs=%u used=%zu cap=%zu\n",
+                         selected.bytes, selected.refs, total, limit_bytes_);
+        }
+        for (auto * store : stores_) for (auto & b : store->blocks_) {
+            if (b.layers.get() != victim) continue;
+            // Discard all layers atomically across every logical reference;
+            // whole-store fallback forbids partially evicted stores on reuse.
+            for (auto & l : *b.layers) l = RawKvStore::LayerBlk{};
+            b.ram_touch = 0;
+            store->ram_evicted_ = true;
+        }
+    }
+}
+
 void RawKvStore::ensure_blocks(uint32_t block_count) {
     if (blocks_.size() >= block_count) {
         return;
@@ -188,7 +403,7 @@ void RawKvStore::ensure_blocks(uint32_t block_count) {
     const size_t old = blocks_.size();
     blocks_.resize(block_count);
     for (size_t i = old; i < blocks_.size(); ++i) {
-        blocks_[i].layers.resize(cfg_.n_layer);
+        blocks_[i].layers->resize(cfg_.n_layer);
     }
 }
 
@@ -251,7 +466,7 @@ void RawKvStore::maybe_flush_k(uint32_t block_id, uint32_t il) {
     if (!nvme_enabled() || block_id >= blocks_.size() || il >= cfg_.n_layer) {
         return;
     }
-    LayerBlk & lb = blocks_[block_id].layers[il];
+    LayerBlk & lb = blocks_[block_id].layers->at(il);
     if (lb.k_on_nvme || lb.k_flushing || lb.k.empty() ||
         lb.n_tokens < cfg_.block_tokens) {
         return;
@@ -287,7 +502,7 @@ void RawKvStore::maybe_flush_v(uint32_t block_id, uint32_t il) {
     if (!nvme_enabled() || block_id >= blocks_.size() || il >= cfg_.n_layer) {
         return;
     }
-    LayerBlk & lb = blocks_[block_id].layers[il];
+    LayerBlk & lb = blocks_[block_id].layers->at(il);
     if (lb.v_on_nvme || lb.v_flushing || lb.n_tokens < cfg_.block_tokens) {
         return;
     }
@@ -397,7 +612,7 @@ void RawKvStore::io_loop() {
                 if (job.block_id >= blocks_.size() || job.il >= cfg_.n_layer) {
                     continue;
                 }
-                LayerBlk & lb = blocks_[job.block_id].layers[job.il];
+                LayerBlk & lb = blocks_[job.block_id].layers->at(job.il);
                 if (job.is_v) {
                     lb.v_flushing = false;
                     lb.v_on_nvme = true;
@@ -425,6 +640,7 @@ void RawKvStore::wait_writes() {
 void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
                                     const float * k, const float * v) {
     std::unique_lock<std::mutex> lk(mu_);
+    require_ram_intact();
     if (n == 0 || il >= cfg_.n_layer || cfg_.block_tokens == 0) {
         return;
     }
@@ -436,13 +652,15 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
+        touch_ram(bid);
         if (k) {
-            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].k_flushing; });
+            cv_.wait(lk, [&] { return !blocks_[bid].layers->at(il).k_flushing; });
         }
         if (v) {
-            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].v_flushing; });
+            cv_.wait(lk, [&] { return !blocks_[bid].layers->at(il).v_flushing; });
         }
-        LayerBlk & lb = blocks_[bid].layers[il];
+        detach_block(bid);
+        LayerBlk & lb = blocks_[bid].layers->at(il);
         if (k && k_is_f16()) {
             const uint64_t row = k_row_bytes();
             const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
@@ -487,11 +705,14 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
         maybe_flush_v(bid, il);
         done += take;
     }
+    lk.unlock();
+    reconcile_ram_budget();
 }
 
 void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
                                         const uint16_t * k, const uint16_t * v) {
     std::unique_lock<std::mutex> lk(mu_);
+    require_ram_intact();
     if (n == 0 || il >= cfg_.n_layer || cfg_.block_tokens == 0) {
         return;
     }
@@ -503,13 +724,15 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
+        touch_ram(bid);
         if (k) {
-            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].k_flushing; });
+            cv_.wait(lk, [&] { return !blocks_[bid].layers->at(il).k_flushing; });
         }
         if (v) {
-            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].v_flushing; });
+            cv_.wait(lk, [&] { return !blocks_[bid].layers->at(il).v_flushing; });
         }
-        LayerBlk & lb = blocks_[bid].layers[il];
+        detach_block(bid);
+        LayerBlk & lb = blocks_[bid].layers->at(il);
         if (k && k_is_f16()) {
             const uint64_t row = k_row_bytes();
             const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
@@ -555,11 +778,14 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
         maybe_flush_v(bid, il);
         done += take;
     }
+    lk.unlock();
+    reconcile_ram_budget();
 }
 
 void RawKvStore::write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
                                     const uint8_t * k, const float * k_f32) {
     std::unique_lock<std::mutex> lk(mu_);
+    require_ram_intact();
     if (!k || n == 0 || il >= cfg_.n_layer || cfg_.block_tokens == 0 ||
         k_row_bytes() == 0) {
         return;
@@ -573,8 +799,10 @@ void RawKvStore::write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
-        cv_.wait(lk, [&] { return !blocks_[bid].layers[il].k_flushing; });
-        LayerBlk & lb = blocks_[bid].layers[il];
+        touch_ram(bid);
+        cv_.wait(lk, [&] { return !blocks_[bid].layers->at(il).k_flushing; });
+        detach_block(bid);
+        LayerBlk & lb = blocks_[bid].layers->at(il);
         const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
         if (lb.k.size() < need) {
             if (lb.k_on_nvme) {
@@ -595,11 +823,14 @@ void RawKvStore::write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
         maybe_flush_k(bid, il);
         done += take;
     }
+    lk.unlock();
+    reconcile_ram_budget();
 }
 
 void RawKvStore::write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il,
                                    const uint8_t * v) {
     std::unique_lock<std::mutex> lk(mu_);
+    require_ram_intact();
     if (!v || n == 0 || il >= cfg_.n_layer || cfg_.block_tokens == 0 ||
         cfg_.v_gpu_row_bytes == 0) {
         return;
@@ -613,8 +844,10 @@ void RawKvStore::write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
-        cv_.wait(lk, [&] { return !blocks_[bid].layers[il].v_flushing; });
-        LayerBlk & lb = blocks_[bid].layers[il];
+        touch_ram(bid);
+        cv_.wait(lk, [&] { return !blocks_[bid].layers->at(il).v_flushing; });
+        detach_block(bid);
+        LayerBlk & lb = blocks_[bid].layers->at(il);
         lb.v.clear();
         const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
         const size_t nbytes = static_cast<size_t>(take) * static_cast<size_t>(row);
@@ -645,11 +878,14 @@ void RawKvStore::write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il,
         maybe_flush_v(bid, il);
         done += take;
     }
+    lk.unlock();
+    reconcile_ram_budget();
 }
 
 void RawKvStore::write_layer_k_gpu(uint32_t pos0, uint32_t n, uint32_t il,
                                    const uint8_t * k) {
     std::unique_lock<std::mutex> lk(mu_);
+    require_ram_intact();
     if (!k || n == 0 || il >= cfg_.n_layer || cfg_.block_tokens == 0 ||
         cfg_.k_gpu_row_bytes == 0) {
         return;
@@ -663,7 +899,9 @@ void RawKvStore::write_layer_k_gpu(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
-        LayerBlk & lb = blocks_[bid].layers[il];
+        touch_ram(bid);
+        detach_block(bid);
+        LayerBlk & lb = blocks_[bid].layers->at(il);
         const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
         const size_t nbytes = static_cast<size_t>(take) * static_cast<size_t>(row);
         const uint8_t * src = k + static_cast<size_t>(done) * static_cast<size_t>(row);
@@ -680,11 +918,14 @@ void RawKvStore::write_layer_k_gpu(uint32_t pos0, uint32_t n, uint32_t il,
         lb.n_tokens = std::max(lb.n_tokens, off + take);
         done += take;
     }
+    lk.unlock();
+    reconcile_ram_budget();
 }
 
 void RawKvStore::write_layer_mean_k(uint32_t pos0, uint32_t n, uint32_t il,
                                     const float * k) {
     std::unique_lock<std::mutex> lk(mu_);
+    require_ram_intact();
     if (!k || n == 0 || il >= cfg_.n_layer || cfg_.block_tokens == 0 ||
         cfg_.n_embd_k == 0) {
         return;
@@ -697,16 +938,21 @@ void RawKvStore::write_layer_mean_k(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
-        LayerBlk & lb = blocks_[bid].layers[il];
+        touch_ram(bid);
+        detach_block(bid);
+        LayerBlk & lb = blocks_[bid].layers->at(il);
         add_mean_f32(lb, off, take, k + done * cfg_.n_embd_k);
         lb.n_tokens = std::max(lb.n_tokens, off + take);
         done += take;
     }
+    lk.unlock();
+    reconcile_ram_budget();
 }
 
 void RawKvStore::write_layer_mean_sum(uint32_t pos0, uint32_t n, uint32_t il,
                                       const float * sum) {
     std::unique_lock<std::mutex> lk(mu_);
+    require_ram_intact();
     if (!sum || n == 0 || il >= cfg_.n_layer || cfg_.block_tokens == 0 ||
         cfg_.n_embd_k == 0) {
         return;
@@ -716,7 +962,9 @@ void RawKvStore::write_layer_mean_sum(uint32_t pos0, uint32_t n, uint32_t il,
     const uint32_t off = pos0 % bt;
     const uint32_t take = std::min(n, bt - off);
     ensure_blocks(bid + 1);
-    LayerBlk & lb = blocks_[bid].layers[il];
+    touch_ram(bid);
+    detach_block(bid);
+    LayerBlk & lb = blocks_[bid].layers->at(il);
     if (lb.k_sum.size() != cfg_.n_embd_k) {
         lb.k_sum.assign(cfg_.n_embd_k, 0.0f);
     }
@@ -728,6 +976,8 @@ void RawKvStore::write_layer_mean_sum(uint32_t pos0, uint32_t n, uint32_t il,
     }
     lb.n_tokens = std::max(lb.n_tokens, off + take);
     lb.mean_tokens = off == 0 ? take : std::max(lb.mean_tokens, off + take);
+    lk.unlock();
+    reconcile_ram_budget();
 }
 
 bool RawKvStore::has_block(uint32_t block_id) const {
@@ -735,7 +985,7 @@ bool RawKvStore::has_block(uint32_t block_id) const {
     if (block_id >= blocks_.size()) {
         return false;
     }
-    for (const auto & lb : blocks_[block_id].layers) {
+    for (const auto & lb : *blocks_[block_id].layers) {
         if (lb.n_tokens > 0 &&
             (!lb.k.empty() || lb.k_on_nvme || lb.k_flushing || lb.k_gpu_fmt ||
              (lb.mean_tokens > 0 && !lb.k_sum.empty()))) {
@@ -750,7 +1000,7 @@ bool RawKvStore::has_k(uint32_t block_id, uint32_t il) const {
     if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
         return false;
     }
-    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
     return !lb.k.empty() || lb.k_on_nvme || lb.k_flushing;
 }
 
@@ -759,7 +1009,7 @@ bool RawKvStore::has_k_gpu(uint32_t block_id, uint32_t il, uint32_t n) const {
     if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
         return false;
     }
-    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
     return lb.k_gpu_fmt && !lb.k_gpu.empty() && lb.k_gpu_tokens >= n;
 }
 
@@ -768,7 +1018,7 @@ bool RawKvStore::has_v(uint32_t block_id, uint32_t il) const {
     if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
         return false;
     }
-    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
     return !lb.v.empty() || !lb.v_gpu.empty() || lb.v_on_nvme || lb.v_flushing;
 }
 
@@ -777,8 +1027,8 @@ bool RawKvStore::has_v_gpu(uint32_t block_id, uint32_t il, uint32_t n) const {
     if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
         return false;
     }
-    const LayerBlk & lb = blocks_[block_id].layers[il];
-    return lb.v_gpu_fmt && lb.v_gpu_tokens >= n;
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
+    return lb.v_gpu_fmt && (!lb.v_gpu.empty() || lb.v_on_nvme || lb.v_flushing) && lb.v_gpu_tokens >= n;
 }
 
 uint32_t RawKvStore::n_tokens(uint32_t block_id) const {
@@ -787,7 +1037,7 @@ uint32_t RawKvStore::n_tokens(uint32_t block_id) const {
         return 0;
     }
     uint32_t n = 0;
-    for (const auto & lb : blocks_[block_id].layers) {
+    for (const auto & lb : *blocks_[block_id].layers) {
         n = std::max(n, lb.n_tokens);
     }
     return n;
@@ -838,10 +1088,10 @@ bool RawKvStore::copy_k(uint32_t block_id, uint32_t il, float * out) const {
         return false;
     }
     cv_.wait(lk, [&] {
-        const LayerBlk & x = blocks_[block_id].layers[il];
+        const LayerBlk & x = blocks_[block_id].layers->at(il);
         return !x.k_flushing;
     });
-    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
     if (lb.k.empty() && !lb.k_on_nvme) {
         return false;
     }
@@ -870,10 +1120,10 @@ bool RawKvStore::copy_v(uint32_t block_id, uint32_t il, float * out) const {
         return false;
     }
     cv_.wait(lk, [&] {
-        const LayerBlk & x = blocks_[block_id].layers[il];
+        const LayerBlk & x = blocks_[block_id].layers->at(il);
         return !x.v_flushing;
     });
-    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
     if (lb.v_gpu_fmt && lb.v.empty()) {
         return false;
     }
@@ -905,12 +1155,13 @@ bool RawKvStore::copy_k_rows(uint32_t block_id, uint32_t il, uint8_t * out,
         return false;
     }
     cv_.wait(lk, [&] {
-        const LayerBlk & x = blocks_[block_id].layers[il];
+        const LayerBlk & x = blocks_[block_id].layers->at(il);
         return !x.k_flushing;
     });
-    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
     const uint64_t row = k_row_bytes();
-    const uint32_t nt = std::min(n, lb.n_tokens);
+    if (lb.n_tokens < n) return false;
+    const uint32_t nt = n;
     const uint8_t * src = nullptr;
     if (!lb.k.empty()) {
         src = lb.k.data();
@@ -936,7 +1187,7 @@ bool RawKvStore::copy_k_gpu(uint32_t block_id, uint32_t il, uint8_t * out,
     if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
         return false;
     }
-    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
     if (!lb.k_gpu_fmt || lb.k_gpu.empty() || lb.k_gpu_tokens < n) {
         return false;
     }
@@ -959,10 +1210,10 @@ bool RawKvStore::copy_v_gpu(uint32_t block_id, uint32_t il, uint8_t * out,
         return false;
     }
     cv_.wait(lk, [&] {
-        const LayerBlk & x = blocks_[block_id].layers[il];
+        const LayerBlk & x = blocks_[block_id].layers->at(il);
         return !x.v_flushing;
     });
-    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
     if (!lb.v_gpu_fmt || lb.v_gpu_tokens < n) {
         return false;
     }
@@ -993,6 +1244,7 @@ void RawKvStore::mean_k(uint32_t block_id, uint32_t il, float * out) const {
         std::fill_n(out, cfg_.n_embd_k, 0.0f);
         return;
     }
+    require_ram_intact();
     const auto normalize = [&](const LayerBlk & lb) {
         if (lb.mean_tokens == 0 || lb.k_sum.size() != cfg_.n_embd_k) {
             return false;
@@ -1005,7 +1257,7 @@ void RawKvStore::mean_k(uint32_t block_id, uint32_t il, float * out) const {
         }
         return true;
     };
-    if (normalize(blocks_[block_id].layers[il])) {
+    if (normalize(blocks_[block_id].layers->at(il))) {
         return;
     }
     std::fill_n(out, cfg_.n_embd_k, 0.0f);
@@ -1013,12 +1265,12 @@ void RawKvStore::mean_k(uint32_t block_id, uint32_t il, float * out) const {
         return;
     }
     cv_.wait(lk, [&] {
-        return block_id >= blocks_.size() || !blocks_[block_id].layers[il].k_flushing;
+        return block_id >= blocks_.size() || !blocks_[block_id].layers->at(il).k_flushing;
     });
     if (block_id >= blocks_.size()) {
         return;
     }
-    const LayerBlk & lb = blocks_[block_id].layers[il];
+    const LayerBlk & lb = blocks_[block_id].layers->at(il);
     if (normalize(lb)) {
         return;
     }
@@ -1057,7 +1309,7 @@ size_t RawKvStore::bytes_k() const {
     std::lock_guard<std::mutex> lk(mu_);
     size_t n = nvme_k_bytes_;
     for (const auto & b : blocks_) {
-        for (const auto & lb : b.layers) {
+        for (const auto & lb : *b.layers) {
             n += lb.k.size();
             n += lb.k_gpu.size();
             n += lb.k_sum.size() * sizeof(float);
@@ -1085,12 +1337,89 @@ size_t RawKvStore::bytes_v() const {
     std::lock_guard<std::mutex> lk(mu_);
     size_t n = nvme_v_bytes_;
     for (const auto & b : blocks_) {
-        for (const auto & lb : b.layers) {
+        for (const auto & lb : *b.layers) {
             n += lb.v.size() * sizeof(uint16_t);
             n += lb.v_gpu.size();
         }
     }
     return n;
+}
+
+void RawKvStore::clone_prefix_shared_to(RawKvStore & dst, uint32_t keep_rows, bool require_mean) {
+    if (this == &dst) throw std::invalid_argument("cannot clone a store into itself");
+    if (cfg_.ram_pool != dst.cfg_.ram_pool)
+        throw std::invalid_argument("shared prefix requires the same RAM pool");
+    // Pool -> store is the global lock order; hold it through publication so
+    // the pool cannot scan an intermediate reference count or deadlock us.
+    // The MTP mirror has no RAM-pool budget yet; null on BOTH sides is safe.
+    std::unique_lock<std::mutex> pool_lk;
+    if (cfg_.ram_pool) pool_lk = std::unique_lock<std::mutex>(cfg_.ram_pool->mu_);
+    std::scoped_lock<std::mutex, std::mutex> lk(mu_, dst.mu_);
+    if (cfg_.nvme_bytes || dst.cfg_.nvme_bytes || nvme_enabled() || dst.nvme_enabled() ||
+        cfg_.n_layer == 0 || cfg_.block_tokens != 128 ||
+        cfg_.n_layer != dst.cfg_.n_layer || cfg_.n_embd_k != dst.cfg_.n_embd_k ||
+        cfg_.n_embd_v != dst.cfg_.n_embd_v || cfg_.block_tokens != dst.cfg_.block_tokens ||
+        cfg_.k_row_bytes != dst.cfg_.k_row_bytes ||
+        cfg_.k_gpu_row_bytes == 0 || cfg_.v_gpu_row_bytes == 0 ||
+        cfg_.k_gpu_row_bytes != dst.cfg_.k_gpu_row_bytes ||
+        cfg_.v_gpu_row_bytes != dst.cfg_.v_gpu_row_bytes ||
+        keep_rows < 128 || ram_evicted_ || dst.ram_evicted_ || !dst.blocks_.empty())
+        throw std::invalid_argument("shared prefix requires identical intact RAM-only stores, an empty destination and at least one complete block");
+    const size_t n = keep_rows / 128;
+    const uint32_t tail = keep_rows % 128;
+    if (n > blocks_.size()) throw std::invalid_argument("prefix exceeds source blocks");
+    for (size_t bid = 0; bid < n; ++bid) {
+        const auto & layers = *blocks_[bid].layers;
+        if (layers.size() != cfg_.n_layer) throw std::invalid_argument("incomplete prefix layers");
+        bool has_attention_layer = false;
+        for (const auto & l : layers) {
+            // Hybrid GDN layers have no attention K/V rows at all. The adapter
+            // separately checks that every model attention layer is complete.
+            if (l.n_tokens == 0 && l.k_gpu_tokens == 0 && l.v_gpu_tokens == 0 &&
+                l.k_gpu.empty() && l.v_gpu.empty() && l.k_sum.empty()) continue;
+            has_attention_layer = true;
+            if (l.n_tokens != 128 || l.k_gpu_tokens != 128 || l.v_gpu_tokens != 128 ||
+                !l.k_gpu_fmt || !l.v_gpu_fmt ||
+                l.k_gpu.size() < 128 * cfg_.k_gpu_row_bytes ||
+                l.v_gpu.size() < 128 * cfg_.v_gpu_row_bytes ||
+                (require_mean && cfg_.n_embd_k && (l.mean_tokens != 128 || l.k_sum.size() != cfg_.n_embd_k)) ||
+                l.k_on_nvme || l.v_on_nvme || l.k_flushing || l.v_flushing)
+                throw std::invalid_argument("prefix block lacks complete packed K/V and mean for every attention layer");
+        }
+        if (!has_attention_layer) throw std::invalid_argument("prefix has no attention layer");
+    }
+    // Build first, then publish in one non-throwing swap. Full blocks remain
+    // shared; a checkpoint inside the next block receives an independent
+    // partial copy (no old-branch suffix bytes may become visible as live KV).
+    std::vector<BlockRaw> prefix(blocks_.begin(), blocks_.begin() + n);
+    if (tail) {
+        if (n >= blocks_.size()) throw std::invalid_argument("partial fork block missing");
+        const auto & src = *blocks_[n].layers;
+        if (src.size() != cfg_.n_layer) throw std::invalid_argument("partial fork layers missing");
+        bool any = false;
+        for (const auto & l : src) {
+            if (l.n_tokens == 0 && l.k_gpu_tokens == 0 && l.v_gpu_tokens == 0 &&
+                l.k_gpu.empty() && l.v_gpu.empty() && l.k_sum.empty()) continue;
+            any = true;
+            if (l.n_tokens < tail || l.k_gpu_tokens < tail || l.v_gpu_tokens < tail ||
+                !l.k_gpu_fmt || !l.v_gpu_fmt ||
+                l.k_gpu.size() < tail * cfg_.k_gpu_row_bytes ||
+                l.v_gpu.size() < tail * cfg_.v_gpu_row_bytes)
+                throw std::invalid_argument("partial fork K/V coverage missing");
+        }
+        if (!any) throw std::invalid_argument("partial fork has no attention K/V");
+        BlockRaw partial;
+        partial.layers = std::make_shared<std::vector<LayerBlk>>(src);
+        for (auto & l : *partial.layers) {
+            l.n_tokens = std::min(l.n_tokens, tail);
+            l.k_gpu_tokens = std::min(l.k_gpu_tokens, tail);
+            l.v_gpu_tokens = std::min(l.v_gpu_tokens, tail);
+            l.k_sum.clear(); // server restores exact checkpoint tail mean
+            l.mean_tokens = 0;
+        }
+        prefix.push_back(std::move(partial));
+    }
+    dst.blocks_.swap(prefix);
 }
 
 void RawKvStore::truncate_to(uint32_t token_pos) {
@@ -1100,14 +1429,15 @@ void RawKvStore::truncate_to(uint32_t token_pos) {
         blocks_.clear();
         return;
     }
-    const uint32_t keep = (token_pos + cfg_.block_tokens - 1) / cfg_.block_tokens;
+    const uint32_t keep = (uint64_t(token_pos) + cfg_.block_tokens - 1) / cfg_.block_tokens;
     if (blocks_.size() > keep) {
         blocks_.resize(keep);
     }
     const uint32_t tail = token_pos % cfg_.block_tokens;
     if (tail && blocks_.size() == keep) {
+        detach_block(keep - 1);
         for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
-            auto & lb = blocks_.back().layers[il];
+            auto & lb = blocks_.back().layers->at(il);
             lb.n_tokens = std::min(lb.n_tokens, tail);
             lb.k_gpu_tokens = std::min(lb.k_gpu_tokens, tail);
             lb.v_gpu_tokens = std::min(lb.v_gpu_tokens, tail);
@@ -1132,7 +1462,8 @@ void RawKvStore::invalidate_packed_from(uint32_t token_pos) {
     std::lock_guard<std::mutex> lk(mu_);
     for (uint32_t bid = token_pos / cfg_.block_tokens; bid < blocks_.size(); ++bid) {
         const uint32_t keep = bid == token_pos / cfg_.block_tokens ? token_pos % cfg_.block_tokens : 0;
-        for (auto & lb : blocks_[bid].layers) {
+        detach_block(bid);
+        for (auto & lb : *blocks_[bid].layers) {
             lb.k_gpu_tokens = std::min(lb.k_gpu_tokens, keep);
             lb.v_gpu_tokens = std::min(lb.v_gpu_tokens, keep);
         }
@@ -1147,7 +1478,7 @@ std::vector<float> RawKvStore::mean_checkpoint(uint32_t token_pos) const {
     std::vector<float> state(cfg_.n_layer * stride, 0);
     if (bid >= blocks_.size()) return state;
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
-        const auto & lb = blocks_[bid].layers[il];
+        const auto & lb = blocks_[bid].layers->at(il);
         float * dst = state.data() + il * stride;
         dst[0] = lb.mean_tokens;
         if (!lb.k_sum.empty()) std::copy(lb.k_sum.begin(), lb.k_sum.end(), dst + 1);
@@ -1158,12 +1489,14 @@ std::vector<float> RawKvStore::mean_checkpoint(uint32_t token_pos) const {
 void RawKvStore::restore_mean_checkpoint(uint32_t token_pos, const std::vector<float> & state) {
     if (state.empty()) return;
     std::lock_guard<std::mutex> lk(mu_);
+    require_ram_intact();
     const size_t stride = 1 + cfg_.n_embd_k;
     if (state.size() != cfg_.n_layer * stride) throw std::runtime_error("invalid mean-K checkpoint");
     const uint32_t bid = token_pos / cfg_.block_tokens;
     ensure_blocks(bid + 1);
+    detach_block(bid);
     for (uint32_t il = 0; il < cfg_.n_layer; ++il) {
-        auto & lb = blocks_[bid].layers[il];
+        auto & lb = blocks_[bid].layers->at(il);
         const float * src = state.data() + il * stride;
         lb.mean_tokens = (uint32_t) src[0];
         if (lb.mean_tokens > 0) {
@@ -1178,6 +1511,8 @@ void RawKvStore::clear() {
     wait_writes();
     std::lock_guard<std::mutex> lk(mu_);
     blocks_.clear();
+    ram_evicted_ = false;
+    ram_poisoned_ = false;
     nvme_k_bytes_ = 0;
     nvme_v_bytes_ = 0;
     nvme_syscalls_ = 0;
@@ -1191,8 +1526,8 @@ size_t RawKvStore::allocated_bytes() const {
     std::lock_guard<std::mutex> lk(mu_);
     size_t bytes = sizeof(*this) + blocks_.capacity() * sizeof(BlockRaw);
     for (const auto & b : blocks_) {
-        bytes += b.layers.capacity() * sizeof(LayerBlk);
-        for (const auto & l : b.layers) {
+        bytes += b.layers->capacity() * sizeof(LayerBlk);
+        for (const auto & l : *b.layers) {
             bytes += l.k.capacity() + l.v.capacity()*2 + l.k_gpu.capacity() + l.v_gpu.capacity();
             bytes += l.k_sum.capacity()*sizeof(float);
         }
@@ -1208,10 +1543,11 @@ uint64_t RawKvStore::capacity_bytes(uint32_t tokens, uint32_t populated_layers) 
 }
 
 void RawKvStore::snapshot_buffers(std::vector<SnapshotBuffer> & buffers) {
+    if (cfg_.ram_pool) throw std::runtime_error("RAM-only KV pool rejects session snapshots");
     wait_writes();
     std::lock_guard<std::mutex> lk(mu_);
     if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
-    for (auto & b : blocks_) for (auto & l : b.layers) {
+    for (auto & b : blocks_) for (auto & l : *b.layers) {
         // All lengths, token counts, formats and runtime identity stay in RAM.
         // Empty allocations can be reclaimed too, without serializing capacity.
         if (l.k.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k));
@@ -1223,8 +1559,10 @@ void RawKvStore::snapshot_buffers(std::vector<SnapshotBuffer> & buffers) {
 }
 
 void RawKvStore::snapshot_write(SnapshotWriter & out) {
+    if (cfg_.ram_pool) throw std::runtime_error("RAM-only KV pool rejects session snapshots");
     wait_writes();
     std::lock_guard<std::mutex> lk(mu_);
+    require_ram_intact();
     if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
     out.scalar(uint32_t(0x31564b52));
     out.scalar(cfg_.n_layer); out.scalar(cfg_.n_embd_k); out.scalar(cfg_.n_embd_v);
@@ -1234,10 +1572,10 @@ void RawKvStore::snapshot_write(SnapshotWriter & out) {
     // Per-block section length allows a future reader to build a disk index.
     for (const auto & b : blocks_) {
         uint64_t size = 0;
-        for (const auto & l : b.layers) size += 4*4 + 2 + 5*8 + l.k.size() + l.v.size()*2 +
+        for (const auto & l : *b.layers) size += 4*4 + 2 + 5*8 + l.k.size() + l.v.size()*2 +
             l.k_gpu.size() + l.v_gpu.size() + l.k_sum.size()*4;
         out.scalar(size);
-        for (const auto & l : b.layers) {
+        for (const auto & l : *b.layers) {
             out.scalar(l.n_tokens); out.scalar(l.k_gpu_tokens);
             out.scalar(l.v_gpu_tokens); out.scalar(l.mean_tokens);
             out.scalar(uint8_t(l.k_gpu_fmt)); out.scalar(uint8_t(l.v_gpu_fmt));
@@ -1247,6 +1585,8 @@ void RawKvStore::snapshot_write(SnapshotWriter & out) {
 }
 
 void RawKvStore::snapshot_read(SnapshotReader & in, uint32_t max_blocks) {
+    if (cfg_.ram_pool) throw std::runtime_error("RAM-only KV pool rejects session snapshots");
+    { std::lock_guard<std::mutex> lk(mu_); require_ram_intact(); }
     if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
     in.expect(uint32_t(0x31564b52));
     in.expect(cfg_.n_layer); in.expect(cfg_.n_embd_k); in.expect(cfg_.n_embd_v);
@@ -1260,8 +1600,8 @@ void RawKvStore::snapshot_read(SnapshotReader & in, uint32_t max_blocks) {
         const auto size = in.scalar<uint64_t>();
         const auto before = in.remaining();
         if (size > before) throw std::runtime_error("truncated snapshot block");
-        b.layers.resize(cfg_.n_layer);
-        for (auto & l : b.layers) {
+        b.layers->resize(cfg_.n_layer);
+        for (auto & l : *b.layers) {
             l.n_tokens = in.scalar<uint32_t>(); l.k_gpu_tokens = in.scalar<uint32_t>();
             l.v_gpu_tokens = in.scalar<uint32_t>(); l.mean_tokens = in.scalar<uint32_t>();
             if (std::max({l.n_tokens,l.k_gpu_tokens,l.v_gpu_tokens,l.mean_tokens}) > cfg_.block_tokens)

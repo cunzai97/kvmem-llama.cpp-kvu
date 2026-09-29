@@ -43,7 +43,7 @@ public:
                  ggml_backend_dev_t device, int min_tokens, int max_tokens, int n_threads);
     ~kvmem_vision();
     std::shared_ptr<kvmem_prompt> tokenize(const std::string & prompt, const std::vector<std::vector<uint8_t>> & files);
-    int decode(llama_context * ctx, const kvmem_prompt & prompt, size_t row, int n_batch,
+    int decode(llama_context * ctx, llama_context * ctx_dft, const kvmem_prompt & prompt, size_t row, int n_batch,
                const std::function<int(llama_batch)> & dispatch);
     void reset_stats() { encode_calls = 0; encode_ms = 0; }
     uint32_t encode_calls = 0;

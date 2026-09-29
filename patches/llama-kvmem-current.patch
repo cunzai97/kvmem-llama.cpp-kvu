@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 8a874c96e..95dbc29d0 100644
+index 8a874c9..95dbc29 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -128,6 +128,11 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
@@ -15,7 +15,7 @@ index 8a874c96e..95dbc29d0 100644
  option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
  option(LLAMA_BUILD_TOOLS     "llama: build tools"                                                                ${LLAMA_STANDALONE})
 diff --git a/common/reasoning-budget.cpp b/common/reasoning-budget.cpp
-index 4884299f3..e2a68dad1 100644
+index 4884299..e2a68da 100644
 --- a/common/reasoning-budget.cpp
 +++ b/common/reasoning-budget.cpp
 @@ -185,6 +185,21 @@ static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_tok
@@ -41,7 +41,7 @@ index 4884299f3..e2a68dad1 100644
      auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
      ctx->state = REASONING_BUDGET_IDLE;
 diff --git a/common/reasoning-budget.h b/common/reasoning-budget.h
-index 1b89a04c4..87584c815 100644
+index 1b89a04..87584c8 100644
 --- a/common/reasoning-budget.h
 +++ b/common/reasoning-budget.h
 @@ -43,6 +43,9 @@ struct llama_sampler * common_reasoning_budget_init(
@@ -55,7 +55,7 @@ index 1b89a04c4..87584c815 100644
  // was recorded. Cleared when a new start sequence re-arms the sampler.
  const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 06dea1e1c..bc33776a7 100644
+index 06dea1e..bc33776 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -317,7 +317,7 @@ struct common_sampler * common_sampler_init(
@@ -68,7 +68,7 @@ index 06dea1e1c..bc33776a7 100644
          }
      }
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 77dfe9535..f467ce1da 100644
+index 77dfe95..f467ce1 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -1338,6 +1338,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -228,7 +228,7 @@ index 77dfe9535..f467ce1da 100644
  
  // state of self-speculation (simple implementation, not ngram-map)
 diff --git a/common/speculative.h b/common/speculative.h
-index c968750e2..7f86d3cd5 100644
+index c968750..7f86d3c 100644
 --- a/common/speculative.h
 +++ b/common/speculative.h
 @@ -69,6 +69,7 @@ struct common_speculative_draft_params {
@@ -240,7 +240,7 @@ index c968750e2..7f86d3cd5 100644
  
  common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
-index cc3f8cd36..e7c3d5206 100644
+index cc3f8cd..e7c3d52 100644
 --- a/ggml/include/ggml-backend.h
 +++ b/ggml/include/ggml-backend.h
 @@ -403,6 +403,8 @@ extern "C" {
@@ -253,7 +253,7 @@ index cc3f8cd36..e7c3d5206 100644
      //
      // Utils
 diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
-index 1cd81eeae..4665d07f2 100644
+index 1cd81ee..4665d07 100644
 --- a/ggml/include/ggml-cuda.h
 +++ b/ggml/include/ggml-cuda.h
 @@ -42,6 +42,23 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
@@ -281,7 +281,7 @@ index 1cd81eeae..4665d07f2 100644
  }
  #endif
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 224bdef92..0021a48c5 100644
+index 224bdef..0021a48 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -601,6 +601,8 @@ extern "C" {
@@ -302,7 +302,7 @@ index 224bdef92..0021a48c5 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * q,
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 7c1c0b864..3e93af6f3 100644
+index 7c1c0b8..3e93af6 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -64,13 +64,13 @@ struct ggml_backend_meta_device_context {
@@ -370,7 +370,7 @@ index 7c1c0b864..3e93af6f3 100644
                  name += ",";
              }
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 8bb0ff7bc..ca9ea1be8 100644
+index 8bb0ff7..ca9ea1b 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -2090,6 +2090,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
@@ -403,7 +403,7 @@ index 8bb0ff7bc..ca9ea1be8 100644
                      } break;
                  case GGML_OP_COUNT:
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index ba00a0a73..0bbdd0aca 100644
+index ba00a0a..0bbdd0a 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -10934,15 +10934,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
@@ -435,7 +435,7 @@ index ba00a0a73..0bbdd0aca 100644
              : state_out_base + (iv3 * H + iv1) * S_v * S_v;
  
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..ccc41e279 100644
+index 1b431a7..ccc41e2 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -564,7 +564,7 @@ index 1b431a724..ccc41e279 100644
 +    return cudaGetLastError() == cudaSuccess;
 +}
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
-index f9bf43706..05adbb46c 100644
+index f9bf437..05adbb4 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cuh
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
 @@ -1,6 +1,22 @@
@@ -591,10 +591,304 @@ index f9bf43706..05adbb46c 100644
  struct ggml_cuda_gated_delta_net_fused_cache {
      float * data;        // rollback slot 0
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 27b83503d..d9195f1c5 100644
+index 27b8350..889fb0e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2380,6 +2380,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -79,12 +79,14 @@
+ #include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <cfloat>
+ #include <initializer_list>
+ #include <limits>
+ #include <map>
+ #include <memory>
+ #include <mutex>
++#include <new>
+ #include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -723,21 +725,241 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+ 
+ // cuda buffer
+ 
++#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#define GGML_CUDA_VISION_PARK_SUPPORTED
++struct ggml_backend_cuda_buffer_context;
++static std::mutex ggml_cuda_vision_park_mutex;
++static std::vector<ggml_backend_cuda_buffer_context *> ggml_cuda_vision_park_buffers;
++
++static bool ggml_cuda_vision_cu_ok(CUresult result, const char * operation) {
++    if (result == CUDA_SUCCESS) {
++        return true;
++    }
++    const char * message = nullptr;
++    cuGetErrorString(result, &message);
++    GGML_LOG_ERROR("vision weight parking: %s failed: %s\n", operation, message ? message : "unknown CUDA error");
++    return false;
++}
++
++static bool ggml_cuda_vision_copy(void * dst, const void * src, size_t size, cudaMemcpyKind kind) {
++    const cudaError_t result = cudaMemcpy(dst, src, size, kind);
++    if (result == cudaSuccess) {
++        return true;
++    }
++    GGML_LOG_ERROR("vision weight parking: copy failed: %s\n", cudaGetErrorString(result));
++    (void) cudaGetLastError();
++    return false;
++}
++#endif
++
+ struct ggml_backend_cuda_buffer_context {
+     int device;
+     void * dev_ptr = nullptr;
+     std::string name;
+ 
++#ifdef GGML_CUDA_VISION_PARK_SUPPORTED
++    struct vmm_chunk {
++        size_t offset;
++        size_t size;
++        bool mapped = false;
++        std::vector<uint8_t> snapshot;
++    };
++    ggml_backend_buffer_t owner = nullptr;
++    size_t vmm_size = 0;
++    std::vector<vmm_chunk> chunks;
++
++    bool map_chunk(vmm_chunk & chunk) {
++        CUmemAllocationProp prop = {};
++        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++        prop.location.id = ggml_cuda_get_physical_device(device);
++        CUmemGenericAllocationHandle handle;
++        if (!ggml_cuda_vision_cu_ok(cuMemCreate(&handle, chunk.size, &prop, 0), "cuMemCreate")) {
++            return false;
++        }
++        const CUdeviceptr address = (CUdeviceptr) dev_ptr + chunk.offset;
++        const CUresult result = cuMemMap(address, chunk.size, 0, handle, 0);
++        CU_CHECK(cuMemRelease(handle));
++        if (!ggml_cuda_vision_cu_ok(result, "cuMemMap")) {
++            return false;
++        }
++        CUmemAccessDesc access = {};
++        access.location = prop.location;
++        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++        if (!ggml_cuda_vision_cu_ok(cuMemSetAccess(address, chunk.size, &access, 1), "cuMemSetAccess")) {
++            CU_CHECK(cuMemUnmap(address, chunk.size));
++            return false;
++        }
++        chunk.mapped = true;
++        return true;
++    }
++
++    bool alloc_vmm(size_t size) {
++        const size_t granularity = ggml_cuda_info().devices[device].vmm_granularity;
++        const size_t chunk_size = GGML_PAD(size_t(64) * 1024 * 1024, granularity);
++        vmm_size = GGML_PAD(size, granularity);
++        CUdeviceptr address = 0;
++        if (!ggml_cuda_vision_cu_ok(cuMemAddressReserve(&address, vmm_size, 0, 0, 0), "cuMemAddressReserve")) {
++            vmm_size = 0;
++            return false;
++        }
++        dev_ptr = (void *) address;
++        for (size_t offset = 0; offset < vmm_size; offset += chunk_size) {
++            chunks.push_back({offset, std::min(chunk_size, vmm_size - offset), false, {}});
++            if (!map_chunk(chunks.back())) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    void clear_snapshots() {
++        for (auto & chunk : chunks) {
++            std::vector<uint8_t>().swap(chunk.snapshot);
++        }
++    }
++
++    bool restore() {
++        for (auto & chunk : chunks) {
++            if (!chunk.snapshot.empty()) {
++                GGML_ASSERT(chunk.snapshot.size() == chunk.size);
++                if ((!chunk.mapped && !map_chunk(chunk)) || !ggml_cuda_vision_copy((char *) dev_ptr + chunk.offset,
++                            chunk.snapshot.data(), chunk.size, cudaMemcpyHostToDevice)) {
++                    return false;
++                }
++            }
++        }
++        CUDA_CHECK(cudaDeviceSynchronize());
++        clear_snapshots();
++        return true;
++    }
++#endif
++
+     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+         device(device), dev_ptr(dev_ptr),
+         name(GGML_CUDA_NAME + std::to_string(device)) {
+     }
+ 
+     ~ggml_backend_cuda_buffer_context() {
++#ifdef GGML_CUDA_VISION_PARK_SUPPORTED
++        if (vmm_size) {
++            std::lock_guard<std::mutex> lock(ggml_cuda_vision_park_mutex);
++            ggml_cuda_vision_park_buffers.erase(std::remove(ggml_cuda_vision_park_buffers.begin(),
++                        ggml_cuda_vision_park_buffers.end(), this), ggml_cuda_vision_park_buffers.end());
++            ggml_cuda_set_device(device);
++            CUDA_CHECK(cudaDeviceSynchronize());
++            for (const auto & chunk : chunks) {
++                if (chunk.mapped) {
++                    CU_CHECK(cuMemUnmap((CUdeviceptr) dev_ptr + chunk.offset, chunk.size));
++                }
++            }
++            CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, vmm_size));
++            return;
++        }
++#endif
+         CUDA_CHECK(cudaFree(dev_ptr));
+     }
+ };
+ 
++static bool ggml_backend_cuda_vision_park(int device, size_t bytes, bool park) {
++#ifdef GGML_CUDA_VISION_PARK_SUPPORTED
++    if (device != 0 || ggml_cuda_info().device_count != 1) {
++        GGML_LOG_ERROR("vision weight parking requires one visible CUDA device\n");
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(ggml_cuda_vision_park_mutex);
++    ggml_cuda_set_device(device);
++    CUDA_CHECK(cudaDeviceSynchronize());
++    const int64_t started = ggml_time_us();
++    ggml_backend_cuda_buffer_context * selected = nullptr;
++    for (auto * ctx : ggml_cuda_vision_park_buffers) {
++        if (ctx->device != device) {
++            continue;
++        }
++        for (const auto & chunk : ctx->chunks) {
++            if (!chunk.snapshot.empty()) {
++                if (park) {
++                    GGML_LOG_ERROR("vision weights are already parked\n");
++                    return false;
++                }
++                selected = ctx;
++                break;
++            }
++        }
++        if (park && ctx->owner && ctx->owner->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++                (!selected || ctx->vmm_size > selected->vmm_size)) {
++            selected = ctx;
++        }
++    }
++    if (!park) {
++        if (selected && !selected->restore()) {
++            return false;
++        }
++        GGML_LOG_INFO("vision weight parking: restored in %.2f ms\n", (ggml_time_us() - started) / 1000.0);
++        return true;
++    }
++    if (!selected || !bytes || bytes > selected->vmm_size) {
++        GGML_LOG_ERROR("vision weight parking: no suitable chunked WEIGHTS buffer for %.2f MiB\n", bytes / 1048576.0);
++        return false;
++    }
++    size_t first = selected->chunks.size();
++    size_t staged_bytes = 0;
++    while (staged_bytes < bytes) {
++        staged_bytes += selected->chunks[--first].size;
++    }
++    size_t fail_after = 0;
++    if (const char * inject = std::getenv("GGML_CUDA_VISION_PARK_FAIL_AFTER_CHUNKS")) {
++        char * end = nullptr;
++        const unsigned long long value = std::strtoull(inject, &end, 10);
++        if (!*inject || *end || !value || value > selected->chunks.size() - first) {
++            GGML_LOG_ERROR("vision weight parking: invalid failure injection chunk count\n");
++            return false;
++        }
++        fail_after = size_t(value);
++    }
++    try {
++        for (size_t i = first; i < selected->chunks.size(); ++i) {
++            auto & chunk = selected->chunks[i];
++            chunk.snapshot.resize(chunk.size);
++            if (!ggml_cuda_vision_copy(chunk.snapshot.data(), (char *) selected->dev_ptr + chunk.offset,
++                        chunk.size, cudaMemcpyDeviceToHost)) {
++                selected->clear_snapshots();
++                return false;
++            }
++        }
++    } catch (const std::bad_alloc &) {
++        selected->clear_snapshots();
++        GGML_LOG_ERROR("vision weight parking: CPU snapshot allocation failed\n");
++        return false;
++    }
++    CUDA_CHECK(cudaDeviceSynchronize());
++    for (size_t i = first; i < selected->chunks.size(); ++i) {
++        auto & chunk = selected->chunks[i];
++        const bool unmapped = ggml_cuda_vision_cu_ok(cuMemUnmap((CUdeviceptr) selected->dev_ptr + chunk.offset,
++                    chunk.size), "cuMemUnmap");
++        if (unmapped) {
++            chunk.mapped = false;
++        }
++        if (!unmapped || (fail_after && i - first + 1 == fail_after)) {
++            if (!selected->restore()) {
++                GGML_ABORT("cannot roll back parked CUDA weights; refusing unsafe decode");
++            }
++            GGML_LOG_WARN("vision weight parking: park failed, original weights restored\n");
++            return false;
++        }
++    }
++    GGML_LOG_INFO("vision weight parking: parked %.2f MiB in CPU RAM in %.2f ms; GPU addresses unchanged\n",
++            staged_bytes / 1048576.0, (ggml_time_us() - started) / 1000.0);
++    return true;
++#else
++    GGML_UNUSED(device);
++    GGML_UNUSED(bytes);
++    GGML_UNUSED(park);
++    GGML_LOG_ERROR("vision weight parking requires CUDA VMM\n");
++    return false;
++#endif
++}
++
+ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+     delete ctx;
+@@ -885,6 +1107,36 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+ 
+     ggml_cuda_set_device(buft_ctx->device);
+ 
++#ifdef GGML_CUDA_VISION_PARK_SUPPORTED
++    const char * park_env = std::getenv("GGML_CUDA_VISION_PARK_MIB");
++    if (park_env && std::strcmp(park_env, "0") != 0 && size >= size_t(1024) * 1024 * 1024 &&
++            !std::getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") && ggml_cuda_info().device_count == 1 &&
++            ggml_cuda_info().devices[buft_ctx->device].vmm) {
++        std::unique_ptr<ggml_backend_cuda_buffer_context> ctx(new ggml_backend_cuda_buffer_context(buft_ctx->device, nullptr));
++        try {
++            if (!ctx->alloc_vmm(size)) {
++                return nullptr;
++            }
++            ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx.get(), size);
++            ctx->owner = buffer;
++            {
++                std::lock_guard<std::mutex> lock(ggml_cuda_vision_park_mutex);
++                ggml_cuda_vision_park_buffers.push_back(ctx.get());
++            }
++            GGML_LOG_INFO("vision weight parking: chunked VMM buffer %.2f MiB on CUDA%d\n", ctx->vmm_size / 1048576.0, buft_ctx->device);
++            ctx.release();
++            return buffer;
++        } catch (const std::bad_alloc &) {
++            GGML_LOG_ERROR("vision weight parking: buffer metadata allocation failed\n");
++            if (ctx->owner) {
++                delete ctx->owner;
++                ctx->owner = nullptr;
++            }
++            return nullptr;
++        }
++    }
++#endif
++
+     void * dev_ptr;
+     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+     if (err != cudaSuccess) {
+@@ -2380,6 +2632,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
              ggml_cuda_op_gated_linear_attn(ctx, dst);
              break;
          case GGML_OP_GATED_DELTA_NET:
@@ -602,7 +896,7 @@ index 27b83503d..d9195f1c5 100644
              ggml_cuda_op_gated_delta_net(ctx, dst);
              break;
          case GGML_OP_DSV4_HC_COMB:
-@@ -5554,6 +5555,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5554,6 +5807,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
          case GGML_OP_RWKV_WKV7:
              return true;
          case GGML_OP_GATED_DELTA_NET:
@@ -610,8 +904,18 @@ index 27b83503d..d9195f1c5 100644
              //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
  #ifdef GGML_USE_MUSA
              return false;
+@@ -5747,6 +6001,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+ 
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
++    if (strcmp(name, "ggml_backend_cuda_vision_park") == 0) {
++        return (void *)ggml_backend_cuda_vision_park;
++    }
+     if (strcmp(name, "ggml_backend_comm_init") == 0) {
+         return (void *)ggml_backend_cuda_comm_init;
+     }
 diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
-index a6a6b7271..2fac3c1e2 100644
+index a6a6b72..2fac3c1 100644
 --- a/ggml/src/ggml-hip/CMakeLists.txt
 +++ b/ggml/src/ggml-hip/CMakeLists.txt
 @@ -133,6 +133,37 @@ else()
@@ -653,7 +957,7 @@ index a6a6b7271..2fac3c1e2 100644
      message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
  endif()
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index a286083b9..eb42af60f 100644
+index a286083..eb42af6 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1099,9 +1099,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -698,7 +1002,7 @@ index a286083b9..eb42af60f 100644
      result->src[1] = k;
      result->src[2] = v;
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b0d..c2c15e2b1 100644
+index 31bbf8b..c2c15e2 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -269,6 +269,10 @@ extern "C" {
@@ -713,7 +1017,7 @@ index 31bbf8b0d..c2c15e2b1 100644
  
      enum llama_model_kv_override_type {
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index afdaddc79..c8c28ec95 100644
+index afdaddc..c8c28ec 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -70,6 +70,43 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
@@ -761,7 +1065,7 @@ index afdaddc79..c8c28ec95 100644
      set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
      target_compile_definitions(llama PRIVATE LLAMA_BUILD)
 diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
-index 2b98a552f..106ce11f4 100644
+index 2b98a55..106ce11 100644
 --- a/src/llama-batch.cpp
 +++ b/src/llama-batch.cpp
 @@ -758,6 +758,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
@@ -797,7 +1101,7 @@ index 2b98a552f..106ce11f4 100644
          LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
  
 diff --git a/src/llama-batch.h b/src/llama-batch.h
-index a3d1889d4..dcba8c198 100644
+index a3d1889..dcba8c1 100644
 --- a/src/llama-batch.h
 +++ b/src/llama-batch.h
 @@ -54,6 +54,8 @@ struct llama_ubatch {
@@ -819,7 +1123,7 @@ index a3d1889d4..dcba8c198 100644
  
  // a helper for sanitizing, fulfilling and splitting a batch
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index fcd4dfb13..706aeb4d7 100644
+index fcd4dfb..706aeb4 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -12,6 +12,9 @@
@@ -881,7 +1185,7 @@ index fcd4dfb13..706aeb4d7 100644
  
      return res;
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 07ca49ad0..3fc1b964e 100644
+index 07ca49a..3fc1b96 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -15,6 +15,9 @@
@@ -1010,7 +1314,7 @@ index 07ca49ad0..3fc1b964e 100644
  
  ggml_tensor * llm_graph_context::build_cvec(
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index cc4110639..f503e1e09 100644
+index cc41106..f503e1e 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -820,6 +820,7 @@ struct llm_graph_params {
@@ -1038,7 +1342,7 @@ index cc4110639..f503e1e09 100644
      // common
      //
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 332d1abe0..18d0a40fa 100644
+index 332d1ab..18d0a40 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -379,6 +379,31 @@ void llama_kv_cache::clear(bool data) {
@@ -1187,7 +1491,7 @@ index 332d1abe0..18d0a40fa 100644
      }
  }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index c4d8699de..5850e0978 100644
+index c4d8699..5850e09 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -165,8 +165,10 @@ public:
@@ -1202,7 +1506,7 @@ index c4d8699de..5850e0978 100644
      // state_read, plus the cells the restored tokens were placed in
      // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
 diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
-index 5d567a6ed..969dcd828 100644
+index 5d567a6..969dcd8 100644
 --- a/src/llama-kv-cells.h
 +++ b/src/llama-kv-cells.h
 @@ -18,6 +18,7 @@ struct llama_kv_cell_ext {
@@ -1215,7 +1519,7 @@ index 5d567a6ed..969dcd828 100644
      bool is_2d_gt(llama_pos ox, llama_pos oy) const {
 diff --git a/src/llama-kvmem-factory.h b/src/llama-kvmem-factory.h
 new file mode 100644
-index 000000000..8493b3ea6
+index 0000000..8493b3e
 --- /dev/null
 +++ b/src/llama-kvmem-factory.h
 @@ -0,0 +1,16 @@
@@ -1236,7 +1540,7 @@ index 000000000..8493b3ea6
 +        const llama_cparams & cparams);
 +#endif
 diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
-index 42c7381a9..35aab9ea7 100644
+index 42c7381..35aab9e 100644
 --- a/src/llama-memory-hybrid.cpp
 +++ b/src/llama-memory-hybrid.cpp
 @@ -29,7 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
@@ -1260,7 +1564,7 @@ index 42c7381a9..35aab9ea7 100644
  
  llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
 diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
-index 484eafb74..488c7a15e 100644
+index 484eafb..488c7a1 100644
 --- a/src/llama-memory-hybrid.h
 +++ b/src/llama-memory-hybrid.h
 @@ -39,7 +39,8 @@ public:
@@ -1274,7 +1578,7 @@ index 484eafb74..488c7a15e 100644
      ~llama_memory_hybrid() = default;
  
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 57919accf..50843b63c 100644
+index 57919ac..50843b6 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -25,14 +25,19 @@ llama_memory_recurrent::llama_memory_recurrent(
@@ -1451,7 +1755,7 @@ index 57919accf..50843b63c 100644
      return mem->r_l[il];
  }
 diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
-index 4abb3f5cf..fda92dbba 100644
+index 4abb3f5..fda92db 100644
 --- a/src/llama-memory-recurrent.h
 +++ b/src/llama-memory-recurrent.h
 @@ -5,6 +5,7 @@
@@ -1510,7 +1814,7 @@ index 4abb3f5cf..fda92dbba 100644
      ggml_tensor * get_r_l(int32_t il) const;
      ggml_tensor * get_s_l(int32_t il) const;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index e195f50d0..ac799e81b 100644
+index e195f50..ac799e8 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -18,6 +18,7 @@
@@ -1535,7 +1839,7 @@ index e195f50d0..ac799e81b 100644
          // Models that need specific instantiation should be handled in the
          // switch statement
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index ad6612647..831d0a20d 100644
+index ad66126..831d0a2 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
 @@ -460,6 +460,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
@@ -1611,7 +1915,7 @@ index ad6612647..831d0a20d 100644
  
      // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
 diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
-index f4b2a2aeb..d75c2db19 100644
+index f4b2a2a..d75c2db 100644
 --- a/src/models/qwen3.cpp
 +++ b/src/models/qwen3.cpp
 @@ -88,6 +88,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
@@ -1639,7 +1943,7 @@ index f4b2a2aeb..d75c2db19 100644
              cur = build_attn(inp_attn,
                      model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index a1e263500..81ca29702 100644
+index a1e2635..81ca297 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
 @@ -280,12 +280,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
@@ -1679,7 +1983,7 @@ index a1e263500..81ca29702 100644
      Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
              n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8402fcfe0..065d5932f 100644
+index 8402fcf..065d593 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -11515,6 +11515,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
@@ -1692,8 +1996,256 @@ index 8402fcfe0..065d5932f 100644
      // TG: n_seq_tokens=1 (autoregressive)
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index feceb7f..06f83bf 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -25,6 +25,7 @@
+ #include <limits>
+ #include <array>
+ #include <functional>
++#include <mutex>
+ #include <float.h>
+ 
+ struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
+@@ -178,9 +179,131 @@ struct clip_ctx {
+     std::mt19937 rng{std::random_device{}()};
+     uint32_t rng_seed = UINT32_MAX;
+ 
++    bool gpu_on_demand = false;
++    ggml_backend_dev_t vision_device = nullptr;
++    ggml_backend_sched_eval_callback eval_callback = nullptr;
++    void * eval_user_data = nullptr;
++    ggml_backend_buffer_ptr gpu_weights;
++    std::mutex encode_mutex;
++    struct weight_binding {
++        ggml_tensor * tensor;
++        void * data;
++        ggml_backend_buffer_t buffer;
++        void * extra;
++        ggml_type type;
++        std::array<size_t, GGML_MAX_DIMS> nb;
++    };
++    std::vector<weight_binding> cpu_weights;
++
++    void enable_on_demand() {
++        const char * enabled = std::getenv("MTMD_VISION_GPU_ON_DEMAND");
++        if (no_alloc || !enabled || std::strcmp(enabled, "1") != 0) {
++            return;
++        }
++        if (backend == backend_cpu || std::strncmp(ggml_backend_name(backend), "CUDA", 4) != 0) {
++            throw std::runtime_error("on-demand vision requires a CUDA GPU and mmproj offload");
++        }
++        vision_device = ggml_backend_get_device(backend);
++        gpu_on_demand = true;
++    }
++
++    void save_cpu_weights() {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx_data.get()); t; t = ggml_get_next_tensor(ctx_data.get(), t)) {
++            if (t->view_src || (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32)) {
++                throw std::runtime_error("on-demand vision currently requires F16/F32 leaf weights");
++            }
++            weight_binding b = { t, t->data, t->buffer, t->extra, t->type, {} };
++            std::copy(t->nb, t->nb + GGML_MAX_DIMS, b.nb.begin());
++            cpu_weights.push_back(b);
++        }
++    }
++
++    size_t memory_headroom() const {
++        const char * value = std::getenv("MTMD_VISION_GPU_HEADROOM_MIB");
++        if (!value) {
++            return 256 * 1024 * 1024;
++        }
++        char * end = nullptr;
++        unsigned long long mib = std::strtoull(value, &end, 10);
++        if (!*value || *end || mib < 256 || mib > 1048576) {
++            throw std::runtime_error("MTMD_VISION_GPU_HEADROOM_MIB must be between 256 and 1048576");
++        }
++        return size_t(mib) * 1024 * 1024;
++    }
++
++    void check_gpu_memory(size_t bytes, const char * phase) const {
++        size_t free_bytes = 0, total_bytes = 0;
++        ggml_backend_dev_memory(vision_device, &free_bytes, &total_bytes);
++        const size_t margin = memory_headroom();
++        LOG_INF("vision on-demand: %s needs %.2f MiB + %.2f MiB headroom; free %.2f MiB\n",
++                phase, bytes / 1048576.0, margin / 1048576.0, free_bytes / 1048576.0);
++        if (bytes > free_bytes || margin > free_bytes - bytes) {
++            throw std::runtime_error(string_format("vision GPU memory insufficient for %s; reduce context/image size or free GPU memory", phase));
++        }
++    }
++
++    void release_vision_gpu() {
++        if (sched) {
++            ggml_backend_sched_synchronize(sched.get());
++            sched.reset();
++        }
++        if (backend && backend != backend_cpu) {
++            ggml_backend_synchronize(backend);
++        }
++        gpu_weights.reset();
++        for (const auto & b : cpu_weights) {
++            b.tensor->data = b.data;
++            b.tensor->buffer = b.buffer;
++            b.tensor->extra = b.extra;
++            b.tensor->type = b.type;
++            std::copy(b.nb.begin(), b.nb.end(), b.tensor->nb);
++        }
++        if (backend && backend != backend_cpu) {
++            ggml_backend_free(backend);
++        }
++        backend = nullptr;
++        backend_ptrs.clear();
++        backend_buft.clear();
++        is_allocated = false;
++    }
++
++    void acquire_vision_gpu() {
++        const int64_t start = ggml_time_us();
++        backend = ggml_backend_dev_init(vision_device, nullptr);
++        if (!backend) {
++            throw std::runtime_error("failed to recreate vision GPU backend");
++        }
++        backend_ptrs = {backend, backend_cpu};
++        backend_buft = {ggml_backend_get_default_buffer_type(backend), ggml_backend_get_default_buffer_type(backend_cpu)};
++        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, true));
++        if (!sched) {
++            throw std::runtime_error("failed to recreate vision scheduler");
++        }
++        ggml_backend_sched_set_eval_callback(sched.get(), eval_callback, eval_user_data);
++        for (const auto & b : cpu_weights) {
++            b.tensor->data = nullptr;
++            b.tensor->buffer = nullptr;
++            b.tensor->extra = nullptr;
++        }
++        const size_t size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx_data.get(), backend_buft[0]);
++        check_gpu_memory(size, "weights");
++        gpu_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_data.get(), backend_buft[0]));
++        if (!gpu_weights) {
++            throw std::runtime_error("failed to allocate vision GPU weights");
++        }
++        ggml_backend_buffer_set_usage(gpu_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        for (const auto & b : cpu_weights) {
++            ggml_backend_tensor_set(b.tensor, b.data, 0, ggml_nbytes(b.tensor));
++        }
++        ggml_backend_synchronize(backend);
++        LOG_INF("vision on-demand: uploaded %.2f MiB in %.2f ms\n", size / 1048576.0, (ggml_time_us() - start) / 1000.0);
++    }
++
+     clip_ctx(clip_context_params & ctx_params) {
+         flash_attn_type = ctx_params.flash_attn_type;
+         no_alloc = ctx_params.no_alloc;
++        eval_callback = ctx_params.cb_eval;
++        eval_user_data = ctx_params.cb_eval_user_data;
+         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+         if (!backend_cpu) {
+             throw std::runtime_error("failed to initialize CPU backend");
+@@ -229,10 +352,9 @@ struct clip_ctx {
+     }
+ 
+     ~clip_ctx() {
+-        ggml_backend_free(backend);
+-        if (backend != backend_cpu) {
+-            ggml_backend_free(backend_cpu);
+-        }
++        release_vision_gpu();
++        buf.reset();
++        ggml_backend_free(backend_cpu);
+     }
+ 
+     // this function is added so that we don't change too much of the existing code
+@@ -3608,8 +3730,12 @@ struct clip_model_loader {
+             }
+ 
+             // alloc memory and offload data
+-            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
++            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(
++                    ctx_clip.gpu_on_demand ? ctx_clip.backend_cpu : ctx_clip.backend);
+             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
++            if (!ctx_clip.buf) {
++                throw std::runtime_error("failed to allocate CLIP weights");
++            }
+             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+             // read the weight from file
+             if (!ctx_clip.no_alloc) {
+@@ -3773,7 +3899,17 @@ struct clip_model_loader {
+     // only initialize backend buffers, but do not allocate them yet
+     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
+         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
+-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
++        if (ctx_clip.gpu_on_demand) {
++            std::vector<size_t> sizes(ctx_clip.backend_ptrs.size(), 0);
++            ggml_backend_sched_reserve_size(ctx_clip.sched.get(), gf, sizes.data());
++            ctx_clip.check_gpu_memory(sizes[0], "compute graph");
++            // Splitting rewrites graph sources to scheduler-owned copies.
++            ggml_backend_sched_reset(ctx_clip.sched.get());
++            gf = clip_get_graph_builder(&ctx_clip, batch)->build();
++        }
++        if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
++            throw std::runtime_error("failed to reserve CLIP compute graph");
++        }
+ 
+         ctx_clip.mem_compute.clear();
+         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
+@@ -3980,9 +4116,14 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
+         if (loader.has_vision) {
+             ctx_vision = new clip_ctx(ctx_params);
+             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
++            ctx_vision->enable_on_demand();
+             loader.load_tensors(*ctx_vision);
+             loader.init_ctx(*ctx_vision);
+-            if (ctx_params.warmup) {
++            if (ctx_vision->gpu_on_demand) {
++                ctx_vision->save_cpu_weights();
++                ctx_vision->release_vision_gpu();
++                LOG_INF("vision on-demand: weights resident in CPU RAM; GPU upload deferred until image encode\n");
++            } else if (ctx_params.warmup) {
+                 loader.warmup(*ctx_vision);
+             }
+ 
+@@ -4424,7 +4565,7 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
+     }
+ }
+ 
+-bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
++static bool clip_encode_impl(struct clip_ctx * ctx, struct clip_encode_params * params) {
+     const clip_image_f32_batch & imgs = *params->imgs;
+     int n_batch_cur = imgs.entries.size();
+ 
+@@ -5924,6 +6065,31 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+     return true;
+ }
+ 
++bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
++    std::lock_guard<std::mutex> lock(ctx->encode_mutex);
++    const auto initial_flash_attn = ctx->flash_attn_type;
++    struct residency_guard {
++        clip_ctx * ctx;
++        ~residency_guard() {
++            if (ctx->gpu_on_demand) {
++                const int64_t start = ggml_time_us();
++                ctx->release_vision_gpu();
++                LOG_INF("vision on-demand: released GPU weights, graph and scratch in %.2f ms\n", (ggml_time_us() - start) / 1000.0);
++            }
++        }
++    } guard{ctx};
++    try {
++        if (ctx->gpu_on_demand) {
++            ctx->acquire_vision_gpu();
++        }
++        return clip_encode_impl(ctx, params);
++    } catch (const std::exception & e) {
++        ctx->flash_attn_type = initial_flash_attn;
++        LOG_ERR("%s: %s\n", __func__, e.what());
++        return false;
++    }
++}
++
+ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
+     switch (ctx->model.proj_type) {
+         case PROJECTOR_TYPE_LDP:
 diff --git a/tools/mtmd/mtmd-helper.cpp b/tools/mtmd/mtmd-helper.cpp
-index bdf8bf6fe..7b83b160d 100644
+index bdf8bf6..7b83b16 100644
 --- a/tools/mtmd/mtmd-helper.cpp
 +++ b/tools/mtmd/mtmd-helper.cpp
 @@ -115,7 +115,7 @@ private:
@@ -1739,7 +2291,7 @@ index bdf8bf6fe..7b83b160d 100644
          struct llama_context * lctx,
          const mtmd_input_chunk * chunk,
 diff --git a/tools/mtmd/mtmd-helper.h b/tools/mtmd/mtmd-helper.h
-index 10f2171c0..ab0d089b8 100644
+index 10f2171..ab0d089 100644
 --- a/tools/mtmd/mtmd-helper.h
 +++ b/tools/mtmd/mtmd-helper.h
 @@ -133,6 +133,14 @@ MTMD_API int32_t mtmd_helper_decode_image_chunk(mtmd_context * ctx,
@@ -1758,7 +2310,7 @@ index 10f2171c0..ab0d089b8 100644
  // video input helpers (requires ffmpeg/ffprobe installed on the system)
  // the notion of video only exists at the helper level, it is not visible to the core mtmd library
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index 2ff790a5d..b2d4ebb7c 100644
+index 2ff790a..b2d4ebb 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
 @@ -1147,62 +1147,8 @@ static void handle_media(
@@ -1903,7 +2455,7 @@ index 2ff790a5d..b2d4ebb7c 100644
  
      common_chat_templates_inputs inputs;
 diff --git a/tools/server/server-common.h b/tools/server/server-common.h
-index 9894f5f06..2fed31262 100644
+index 9894f5f..2fed312 100644
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
 @@ -325,6 +325,9 @@ struct server_chat_params {

@@ -16,7 +16,8 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 
-#include <cuda_runtime.h>
+// Use the adapter's CUDA/HIP runtime shim; direct cuda_runtime.h breaks HIP builds.
+#include "llama-kvmem-gpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -634,6 +635,30 @@ void llama_memory_kvmem_mtp::harvest_resident_v() {
         }
         harvest_k(b.block_id);
         harvest_v(b.block_id);
+    }
+}
+
+void llama_memory_kvmem_mtp::fork_prefix_from(kvmem::RawKvStore & source, uint32_t keep_rows) {
+    if (!target_ || !kv_ || !raw_ || keep_rows < block_tokens_ ||
+        !raw_->config().nvme_dir.empty() || source.nvme_enabled()) {
+        throw std::runtime_error("draft fork mirror unavailable");
+    }
+    const auto & blocks = target_->store().blocks();
+    for (uint32_t id = 0; id < blocks.size(); ++id) {
+        const auto & b = blocks[id];
+        if (b.orig_pos_start >= keep_rows) break;
+        const uint32_t n = std::min(b.n_tokens, keep_rows - b.orig_pos_start);
+        if (!source.has_k_gpu(id, 0, n) || (!v_trans_ && !source.has_v_gpu(id, 0, n))) {
+            throw std::runtime_error("draft fork mirror lacks packed K/V");
+        }
+    }
+    source.clone_prefix_shared_to(*raw_, keep_rows, false);
+    follow_retrieval();
+    for (const auto & b : blocks) {
+        if (b.orig_pos_start >= keep_rows) break;
+        if (b.gpu_slot < 0 || !slot_holds(b.gpu_slot, b.orig_pos_start)) {
+            throw std::runtime_error("draft fork GPU cells not restored");
+        }
     }
 }
 

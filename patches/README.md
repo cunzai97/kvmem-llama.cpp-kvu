@@ -4,7 +4,7 @@
 llama.cpp `v0.5.0` release (`7fe450e19305b828c199d602c23a8337aaa1f03b`).
 It includes the existing KVMem hooks, multimodal batch, MTP, media
 parser and mtmd helper extensions, plus FP32 GDN Record/Fold for ReplaySSM.
-It also fixes reasoning-budget initialization from a template's generation prefix.
+It also fixes reasoning-budget initialization from a template's generation prefix, and includes CUDA VMM parking plus on-demand upload/release for V100 vision weights. The separate RDNA2 patch remains a distinct follow-up.
 `scripts/apply-patches.sh` applies it
 without creating commits and checks for an already applied tree.
 

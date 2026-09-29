@@ -51,6 +51,8 @@ struct kvmem_store_match {
     int      live_row   = 0;  // rows actually live in the store
     int      last_n_gen = 0;  // generated rows of this store's last turn
     std::vector<int> ckpt_rows;
+    // Exact checkpoints with recurrent data, eligible for RAM-only branch copying.
+    std::vector<int> fork_ckpt_rows;
     uint64_t bytes      = 0;  // accounted host bytes of this store
     uint64_t used       = 0;  // LRU stamp; larger is more recent
     std::string client_id;    // bound kvmem.conversation_id, empty when inferred
@@ -68,7 +70,9 @@ struct kvmem_store_plan {
     int  id    = -1;
     int  lcp   = 0;
     int  keep  = 0;
-    // Least-recently-used first, never plan.id and never limits.attached.
+    int  fork_source = -1; // fresh only; parked source to copy, never truncate
+    int  fork_keep   = 0;  // exact checkpoint; full 128-row blocks share, tail copied
+    // Least-recently-used first, never plan.id, fork_source or limits.attached.
     // Count evictions come before byte evictions, so the whole list is
     // ascending by `used`.
     std::vector<int> evict;
@@ -132,7 +136,7 @@ inline void kvmem_store_plan_evictions(const std::vector<kvmem_store_match> & st
                                        bool allocating, kvmem_store_plan & plan) {
     std::vector<const kvmem_store_match *> victims;
     for (const auto & store : stores) {
-        if (store.id != plan.id && store.id != limits.attached) {
+        if (store.id != plan.id && store.id != plan.fork_source && store.id != limits.attached) {
             victims.push_back(&store);
         }
     }
@@ -164,7 +168,8 @@ inline void kvmem_store_plan_evictions(const std::vector<kvmem_store_match> & st
 inline kvmem_store_plan kvmem_store_select(const std::vector<kvmem_store_match> & stores,
                                            int eval_end, bool spec_ok,
                                            const std::string & client_id,
-                                           const kvmem_store_limits & limits) {
+                                           const kvmem_store_limits & limits,
+                                           bool allow_ram_fork = false) {
     kvmem_store_plan plan;
     // Rule 5: an explicit conversation id is a pure optimization that
     // restricts the candidate set. An unknown id degrades to inferred
@@ -223,6 +228,26 @@ inline kvmem_store_plan kvmem_store_select(const std::vector<kvmem_store_match> 
                 : !any_found              ? "no_recurrent_checkpoint"
                 : rejected_keep == 0      ? "fork_zero_keep"
                                           : "fork_shared_prefix";
+    // Only a genuinely branched prompt may copy a prefix. An exact recurrent
+    // checkpoint (not a rounded-down arbitrary row) must agree with the
+    // media-aware LCP and the actual live row. The server checks the source's
+    // payload and adapter rows again before invoking the RAM-only mechanism.
+    if (allow_ram_fork) {
+        const kvmem_store_match * source = nullptr;
+        for (const auto * store : candidates) {
+            if (kvmem_store_continuation(*store)) continue;
+            const int cap = kvmem_store_keep_cap(*store, eval_end, spec_ok);
+            for (int row : store->fork_ckpt_rows) {
+                if (row < 128 || row > cap) continue;
+                if (!source || row > plan.fork_keep ||
+                    (row == plan.fork_keep && store->used > source->used)) {
+                    source = store;
+                    plan.fork_source = store->id;
+                    plan.fork_keep = row;
+                }
+            }
+        }
+    }
     kvmem_store_plan_evictions(stores, limits, true, plan);
     return plan;
 }

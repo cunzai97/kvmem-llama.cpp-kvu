@@ -192,6 +192,9 @@ public:
     // arena per process.
     bool conv_swap_supported(std::string & reason) const;
     std::unique_ptr<ConvStore> make_conv();
+    // On an empty active RAM-pool store, share a detached source's complete
+    // prefix blocks and restage that prefix without changing the source.
+    bool fork_from_detached(const ConvStore & source, uint32_t keep_rows) noexcept;
     // Exchange the per-conversation host state. Call only between requests,
     // under the server's request lock. `conv` must come from make_conv() or an
     // earlier swap_conv() on this object; on return it holds the outgoing
@@ -208,6 +211,9 @@ public:
     // cannot be drained safely, or whose drain throws, is emptied rather than
     // kept, which the caller sees as its row count dropping to zero.
     bool swap_conv(std::unique_ptr<ConvStore> & conv);
+    // Exact block-boundary suffix recovery only; -1 means no safe suffix.
+    int32_t conv_missing_suffix(const ConvStore & conv) const;
+    bool conv_recover_suffix(ConvStore & conv, uint32_t keep_rows) noexcept;
     uint32_t conv_n_tokens(const ConvStore & conv) const;
     uint64_t conv_host_bytes(const ConvStore & conv) const;
     uint64_t host_bytes() const;

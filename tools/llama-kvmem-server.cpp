@@ -614,6 +614,7 @@ static kvmem_store_match conversation_match(const ServerState & st, int id, cons
         match.live_row = active ? st.mm_live_row : conv.mm_live_row;
         for (const auto & checkpoint : (active ? st.mm_checkpoints : conv.mm_checkpoints)) {
             match.ckpt_rows.push_back(checkpoint.row);
+            if (checkpoint.data) match.fork_ckpt_rows.push_back(checkpoint.row);
         }
     } else {
         // Legacy path: the token prefix, gated by the rows the store actually
@@ -861,8 +862,84 @@ static void conversation_begin_request(ServerState & st, const kvmem_prompt & pr
     // client's store.
     kvmem_store_limits limits = st.conv_limits;
     limits.attached = st.conv_active;
-    const kvmem_store_plan plan = kvmem_store_select(matches, eval_end, st.spec.ok,
-            client_id, limits);
+    // No change to ordinary multi-store configurations or disk/snapshot paths.
+    // Adapter forks both target and MTP mirrors or rejects the branch, so the
+    // source recurrent checkpoint and draft carry may be restored together.
+    const bool allow_ram_fork = !st.session_files && !st.mm_reset_requested &&
+            (st.vision || st.query_policy_user) &&
+            std::getenv("KVMEM_EXPERIMENTAL_GLOBAL_RAM_BYTES") != nullptr;
+    kvmem_store_plan plan = kvmem_store_select(matches, eval_end, st.spec.ok,
+            client_id, limits, allow_ram_fork);
+    // A server checkpoint does not prove that the adapter still holds its KV:
+    // the experimental RAM pool may have evicted blocks since the last turn.
+    // Validate before pre-eviction, so a rejected source is not protected.
+    if (plan.fork_source >= 0) {
+        const auto source = st.conv.find(plan.fork_source);
+        const auto * held = st.conv_table.find(plan.fork_source);
+        const int keep = plan.fork_keep;
+        bool valid = source != st.conv.end() && held && keep >= 128;
+        if (valid) {
+            const auto & conv = source->second;
+            const bool active = plan.fork_source == st.conv_active;
+            const auto & cached = active ? st.cached_prompt : conv.cached_prompt;
+            const auto & tokens = active ? st.cached_tokens : conv.cached_tokens;
+            const auto & checkpoints = active ? st.mm_checkpoints : conv.mm_checkpoints;
+            valid = !conv.cold && (!conv.payload || !conv.payload->invalid) &&
+                    cached && (int) tokens.size() >= keep &&
+                    (int) cached->tokens.size() >= keep &&
+                    (active ? st.mm_live_row : conv.mm_live_row) >= keep &&
+                    (active ? llama_kvmem_store_n_tokens() : conv.stored) >= (uint32_t) keep &&
+                    std::any_of(checkpoints.begin(), checkpoints.end(),
+                        [keep](const auto & c) { return c.row == keep && c.data != nullptr; }) &&
+                    (int) prompt.common_prefix(*cached) >= keep &&
+                    common_token_prefix(tokens, cached->tokens) >= keep &&
+                    common_token_prefix(tokens, prompt.tokens) >= keep &&
+                    llama_kvmem_store_rows(held->store_id) >= (uint32_t) keep;
+            if (valid) {
+                const auto ranges = cached->media_ranges();
+                valid = std::none_of(ranges.begin(), ranges.end(), [keep](const std::pair<uint32_t, uint32_t> & range) {
+                    return range.first < (uint32_t) keep && range.second > (uint32_t) keep;
+                });
+            }
+        }
+        if (!valid) {
+            kvmem_diag("KVMEM_TRACE store_fork_fallback source=%d keep=%d reason=source_unavailable\n",
+                    plan.fork_source, keep);
+            plan.fork_source = -1;
+            plan.fork_keep = 0;
+            plan.evict.clear();
+            kvmem_store_plan_evictions(matches, limits, true, plan);
+        }
+    }
+    // Keep the source's physical pages pinned while switching it off the GPU.
+    // Without this guard detach_conv() immediately unpins and reconciles the
+    // RAM pool before the child can acquire its shared handles.
+    struct fork_pin_guard {
+        int32_t store = -1;
+        ~fork_pin_guard() { if (store >= 0) (void) llama_kvmem_store_fork_pin(store, false); }
+    } fork_pin;
+    if (plan.fork_source >= 0) {
+        const auto * source = st.conv_table.find(plan.fork_source);
+        if (source && llama_kvmem_store_fork_pin(source->store_id, true)) {
+            fork_pin.store = source->store_id;
+        } else {
+            kvmem_diag("KVMEM_TRACE store_fork_fallback source=%d keep=%d reason=pin_refused\n",
+                    plan.fork_source, plan.fork_keep);
+            plan.fork_source = -1;
+            plan.fork_keep = 0;
+            plan.evict.clear();
+            kvmem_store_plan_evictions(matches, limits, true, plan);
+        }
+    }
+    if (allow_ram_fork && plan.action == kvmem_store_action::fresh) {
+        for (const auto & m : matches) {
+            if (m.lcp < 128) continue;
+            kvmem_diag("KVMEM_TRACE fork_probe source=%d lcp=%d live=%d rows=%d checkpoints=",
+                    m.id, m.lcp, m.live_row, m.rows);
+            for (int row : m.fork_ckpt_rows) kvmem_diag(" %d", row);
+            kvmem_diag("\n");
+        }
+    }
     const bool allocating = plan.action == kvmem_store_action::fresh && plan.id < 0;
     // Two of the conditions the switch needs are already knowable: the
     // previous request's rows must be committed, and conv_active must name the
@@ -914,8 +991,13 @@ static void conversation_begin_request(ServerState & st, const kvmem_prompt & pr
             target = st.conv_table.add(store_id);
             st.conv.emplace(target, kvmem_conversation{});
         } else {
-            // No further host store available. Reuse the least recently used
-            // one, cleared below once the switch has actually attached it.
+            // A fork must never repurpose its source (or another named
+            // branch) if allocating the child failed: fail this request with
+            // the original conversation intact. The scoped physical fork pin
+            // is released while unwinding.
+            if (plan.fork_source >= 0)
+                throw std::runtime_error("cannot allocate independent RAM-pool branch store");
+            // Ordinary fresh requests retain the previous LRU reuse policy.
             target = conversation_lru_victim(st);
             force_reset = target >= 0;
         }
@@ -954,8 +1036,58 @@ static void conversation_begin_request(ServerState & st, const kvmem_prompt & pr
             force_reset = false;
             fell_back = true;
         } else {
+            // Scoped recovery: only a physically contiguous missing suffix,
+            // with an exact saved GDN/MTP checkpoint at its first block.
+            // Internal holes, absent checkpoints, media mismatch and stale
+            // history retain the ordinary explicit full-miss path.
+            int recovered_at = -1;
+            if (!st.session_files && !st.mm_reset_requested && (st.vision || st.query_policy_user) &&
+                std::getenv("KVMEM_EXPERIMENTAL_GLOBAL_RAM_BYTES")) {
+                const int row = llama_kvmem_store_missing_suffix(held->store_id);
+                const auto & conv = incoming->second;
+                const auto media_ranges = prompt.media_ranges();
+                const bool exact = row > 0 && row < eval_end &&
+                    !conv.cold && (!conv.payload || !conv.payload->invalid) &&
+                    conv.cached_prompt && (int) conv.cached_tokens.size() >= row &&
+                    (int) conv.cached_prompt->tokens.size() >= row &&
+                    conv.mm_live_row >= row && conv.stored >= (uint32_t) row &&
+                    (int) prompt.common_prefix(*conv.cached_prompt) >= row &&
+                    common_token_prefix(conv.cached_tokens, conv.cached_prompt->tokens) >= row &&
+                    common_token_prefix(conv.cached_tokens, prompt.tokens) >= row &&
+                    std::any_of(conv.mm_checkpoints.begin(), conv.mm_checkpoints.end(),
+                        [row](const auto & c) { return c.row == row && c.data; }) &&
+                    std::none_of(media_ranges.begin(), media_ranges.end(),
+                        [row](const auto & range) { return (range.first) < static_cast<uint32_t>(row) && (range.second) > static_cast<uint32_t>(row); });
+                if (exact && llama_kvmem_store_recover_suffix(held->store_id, (uint32_t) row)) {
+                    recovered_at = row;
+                    // The parked KV has already been truncated. Commit its
+                    // matching server payload NOW, before switching: if the
+                    // outgoing store later refuses to drain, the parked child
+                    // must not retain checkpoints beyond its physical rows.
+                    auto & recovered = incoming->second;
+                    const uint32_t discarded = recovered.stored - (uint32_t) row;
+                    recovered.stored = (uint32_t) row;
+                    recovered.mm_live_row = row;
+                    recovered.mm_live_checkpoint.reset();
+                    recovered.mm_checkpoints.erase(std::remove_if(recovered.mm_checkpoints.begin(), recovered.mm_checkpoints.end(),
+                        [row](const auto & c) { return c.row > row; }), recovered.mm_checkpoints.end());
+                    recovered.mm_query.reset();
+                    recovered.last_query_begin = recovered.last_query_end = -1;
+                    recovered.last_user_text.clear();
+                    recovered.gdn_ckpt.clear(); recovered.gdn_ckpt_query.clear();
+                    recovered.gdn_carry.clear(); recovered.gdn_query_carry.clear();
+                    recovered.gdn_ckpt_pos = recovered.gdn_ckpt_query_pos = -1;
+                    kvmem_diag("KVMEM_TRACE store_suffix_replay id=%d keep=%d missing_rows=%u\n",
+                        target, row, discarded);
+                } else if (row >= 0) {
+                    kvmem_diag("KVMEM_TRACE store_suffix_fallback id=%d row=%d reason=%s\n",
+                        target, row, exact ? "adapter_refused" : "checkpoint_or_history_unavailable");
+                }
+            }
             conversation_swap(st, outgoing->second);
             restaged = llama_kvmem_store_switch(held->store_id);
+            if (recovered_at >= 0 && llama_kvmem_store_current() != held->store_id)
+                llama_kvmem_store_recovery_unpin(held->store_id);
             if (llama_kvmem_store_current() == held->store_id) {
                 conversation_swap(st, incoming->second);
                 st.conv_active = target;
@@ -1021,6 +1153,66 @@ static void conversation_begin_request(ServerState & st, const kvmem_prompt & pr
         // clears the attached store and its payload and counts the reset.
         kvmem_diag("KVMEM_TRACE store_reuse id=%d reason=no_store_available\n", target);
         memory_clear_all(st);
+    }
+    if (plan.fork_source >= 0) {
+        const auto source = st.conv.find(plan.fork_source);
+        const auto * from = st.conv_table.find(plan.fork_source);
+        const auto * into = st.conv_table.find(target);
+        const int keep = plan.fork_keep;
+        // The source must now be parked and intact; the target must be the
+        // newly switched-to EMPTY store. Never seed a payload before the
+        // adapter reports success, or prefill could see fictional cached KV.
+        const bool ready = !fell_back && switched && !force_reset &&
+                source != st.conv.end() && from && into &&
+                target != plan.fork_source &&
+                llama_kvmem_store_current() == into->store_id &&
+                llama_kvmem_store_n_tokens() == 0 &&
+                llama_kvmem_store_rows(from->store_id) >= (uint32_t) keep &&
+                source->second.cached_prompt &&
+                (int) source->second.cached_tokens.size() >= keep;
+        bool forked = false;
+        if (ready) {
+            try {
+                // Prepare allocations first: failure must leave the new store
+                // empty and take the normal full-prefill path.
+                auto prefix = source->second.cached_prompt->prefix((size_t) keep);
+                std::vector<llama_token> tokens(source->second.cached_tokens.begin(),
+                        source->second.cached_tokens.begin() + keep);
+                std::vector<MultimodalCheckpoint> checkpoints;
+                for (const auto & checkpoint : source->second.mm_checkpoints) {
+                    if (checkpoint.row <= keep) checkpoints.push_back(checkpoint);
+                }
+                if (llama_kvmem_store_fork_into_active(from->store_id, (uint32_t) keep)) {
+                    st.cached_prompt = std::move(prefix);
+                    st.cached_tokens = std::move(tokens);
+                    st.mm_checkpoints = std::move(checkpoints);
+                    st.mm_live_row = keep;
+                    st.mm_live_checkpoint.reset(); // force recurrent + MTP restore
+                    st.mm_query.reset();
+                    st.mm_pending_query.reset();
+                    st.mm_rollback.reset();
+                    st.mm_rollback_prompt.reset();
+                    st.gdn_ckpt.clear();
+                    st.gdn_carry.clear();
+                    st.gdn_query_carry.clear();
+                    st.gdn_ckpt_pos = -1;
+                    st.gdn_ckpt_query.clear();
+                    st.gdn_ckpt_query_pos = -1;
+                    st.last_query_begin = st.last_query_end = -1;
+                    st.last_user_text.clear();
+                    st.last_n_gen = 0;
+                    forked = true;
+                    kvmem_diag("KVMEM_TRACE store_fork source=%d target=%d keep=%d\n",
+                            plan.fork_source, target, keep);
+                }
+            } catch (const std::exception & e) {
+                LOG_WRN("srv    KVMEM fork preparation failed: %s\n", e.what());
+            }
+        }
+        if (!forked) {
+            kvmem_diag("KVMEM_TRACE store_fork_fallback source=%d target=%d keep=%d reason=%s\n",
+                    plan.fork_source, target, keep, ready ? "adapter_refused" : "not_empty_or_source_lost");
+        }
     }
     st.conv_table.touch(target, ++st.conv_clock);
     if (fell_back) {

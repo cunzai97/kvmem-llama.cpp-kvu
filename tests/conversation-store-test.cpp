@@ -58,13 +58,22 @@ static kvmem_store_plan select(const std::vector<kvmem_store_match> & stores, in
         CHECK(chosen != nullptr);
         CHECK(plan.keep > 0 && plan.keep <= kvmem_store_keep_cap(*chosen, eval_end, spec_ok));
     } else {
-        // A fork always asks the caller to allocate; nothing is reset in place.
+        // A fresh request always allocates; optional RAM-only prefix cloning
+        // never turns the source into the target or truncates it.
         CHECK(plan.id == -1 && plan.keep == 0);
+        if (plan.fork_source >= 0) {
+            CHECK(plan.fork_keep >= 128);
+            const auto * source = store_by_id(stores, plan.fork_source);
+            CHECK(source != nullptr && !kvmem_store_continuation(*source));
+            CHECK(plan.fork_keep <= kvmem_store_keep_cap(*source, eval_end, spec_ok));
+            CHECK(std::find(source->fork_ckpt_rows.begin(), source->fork_ckpt_rows.end(),
+                            plan.fork_keep) != source->fork_ckpt_rows.end());
+        }
     }
     uint64_t previous_used = 0;
     for (size_t i = 0; i < plan.evict.size(); ++i) {
         const int id = plan.evict[i];
-        CHECK(id != plan.id);
+        CHECK(id != plan.id && id != plan.fork_source);
         // The caller cannot execute an eviction of the store the GPU working
         // set is bound to, so a plan must never ask for one.
         CHECK(id != limits.attached);
@@ -79,7 +88,9 @@ static kvmem_store_plan select(const std::vector<kvmem_store_match> & stores, in
     const bool allocating = plan.action == kvmem_store_action::fresh && plan.id < 0;
     const int live = (int) stores.size() - (int) plan.evict.size() + (allocating ? 1 : 0);
     const int protected_stores = (plan.id >= 0 ? 1 : 0) +
+            (plan.fork_source >= 0 && plan.fork_source != plan.id ? 1 : 0) +
             (limits.attached >= 0 && limits.attached != plan.id &&
+             limits.attached != plan.fork_source &&
              store_by_id(stores, limits.attached) != nullptr ? 1 : 0);
     const int victims_left = (int) stores.size() - protected_stores - (int) plan.evict.size();
     CHECK(live <= limits.max_stores || victims_left == 0);
@@ -325,6 +336,66 @@ static void test_decision_table() {
 // kvmem.conversation_id was an unrecognized key at v0.16.0-rc3, so a request
 // carrying one was served. It still must be: a value the policy cannot use as
 // a key is dropped here, never reported to the caller as an error.
+static void test_safe_ram_branch_plan() {
+    g_row = "RAM branch exact checkpoint and source preservation";
+    kvmem_store_match source = store_fixture(1, 4096, 16, {0, 127, 128, 256, 384}, 1 * GiB, 1);
+    source.fork_ckpt_rows = {0, 127, 128, 256, 384};
+    source.lcp = 320; // shared prefix, NOT a continuation
+    kvmem_store_match other = store_fixture(2, 100, 0, {}, 1 * GiB, 2);
+    other.lcp = 0;
+    kvmem_store_limits limits{2, 0};
+    limits.attached = other.id;
+    auto plan = kvmem_store_select({source, other}, 400, false, "", limits, true);
+    CHECK(plan.action == kvmem_store_action::fresh && plan.id == -1);
+    CHECK(plan.fork_source == source.id && plan.fork_keep == 256);
+    CHECK(plan.evict.empty()); // source and attached store are protected
+    CHECK(source.rows == 4096 && source.live_row == 4096); // planning is pure
+    // The old behavior is unchanged without RAM-pool opt-in: LRU source evicts.
+    plan = select({source, other}, 400, false, "", limits);
+    CHECK(plan.fork_source == -1 && plan.fork_keep == 0);
+    CHECK(plan.evict == std::vector<int>({source.id}));
+    // At a tight byte cap, the source is still not a pre-eviction victim.
+    limits.max_bytes = 1 * MiB;
+    plan = kvmem_store_select({source, other}, 400, false, "", limits, true);
+    CHECK(plan.fork_source == source.id && plan.evict.empty());
+    limits.max_bytes = 0;
+    limits.attached = source.id; // active source can be parked before the API
+    plan = kvmem_store_select({source, other}, 400, false, "", limits, true);
+    CHECK(plan.fork_source == source.id && plan.evict == std::vector<int>({other.id}));
+
+    g_row = "RAM branch copies a partial checkpoint tail but shares full blocks";
+    source.fork_ckpt_rows = {0, 127, 129, 384};
+    plan = kvmem_store_select({source}, 400, false, "", {4, 0}, true);
+    CHECK(plan.fork_source == source.id && plan.fork_keep == 129);
+    source.fork_ckpt_rows = {0, 127};
+    plan = kvmem_store_select({source}, 400, false, "", {4, 0}, true);
+    CHECK(plan.fork_source == -1 && plan.evict.empty());
+    source.fork_ckpt_rows = {128, 256, 384};
+    plan = kvmem_store_select({source}, 256, false, "", {4, 0}, true);
+    CHECK(plan.fork_keep == 128); // non-spec must evaluate one new row
+    plan = kvmem_store_select({source}, 256, true, "", {4, 0}, true);
+    CHECK(plan.fork_keep == 256); // MTP can keep the entire prompt
+    source.live_row = 127;
+    plan = kvmem_store_select({source}, 400, false, "", {4, 0}, true);
+    CHECK(plan.fork_source == -1);
+    source.live_row = source.rows;
+    source.lcp = 4050; // genuine continuation: extend, never fork
+    plan = kvmem_store_select({source}, 4300, false, "", {4, 0}, true);
+    CHECK(plan.action == kvmem_store_action::extend && plan.fork_source == -1);
+
+    g_row = "RAM branch chooses best candidate and respects a bound client id";
+    source.lcp = 320;
+    source.client_id = "x";
+    other.lcp = 300;
+    other.rows = other.live_row = 4096;
+    other.fork_ckpt_rows = {128};
+    other.client_id = "y";
+    plan = kvmem_store_select({source, other}, 400, false, "y", {4, 0}, true);
+    CHECK(plan.fork_source == other.id && plan.fork_keep == 128);
+    plan = kvmem_store_select({source, other}, 400, false, "unknown", {4, 0}, true);
+    CHECK(plan.fork_source == source.id && plan.fork_keep == 256);
+}
+
 static void test_client_id_never_fails_a_request() {
     g_row = "client id normalization";
     CHECK(kvmem_store_client_id("abc") == "abc");
@@ -505,6 +576,7 @@ static void test_table_lru_and_bytes() {
 
 int main() {
     test_decision_table();
+    test_safe_ram_branch_plan();
     test_client_id_never_fails_a_request();
     test_checkpoint_arithmetic();
     test_continuation_clamps_last_n_gen();

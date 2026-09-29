@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -918,6 +919,26 @@ llama_memory_kvmem::llama_memory_kvmem(
     if (!v_trans_) {
         rcfg.v_gpu_row_bytes = ggml_row_size(type_v_, n_embd_v_);
     }
+    // Opt-in only: all per-conversation trunk RawKvStore objects share one
+    // process-local RAM budget. No text deduplication or disk spill.
+    if (const char * bytes = std::getenv("KVMEM_EXPERIMENTAL_GLOBAL_RAM_BYTES")) {
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long long cap = std::strtoull(bytes, &end, 10);
+        if (!bytes[0] || !end || *end || cap == 0 || bytes[0] == '-' ||
+            errno == ERANGE || cap > SIZE_MAX)
+            throw std::runtime_error("invalid KVMEM_EXPERIMENTAL_GLOBAL_RAM_BYTES");
+        static std::mutex pool_mu;
+        static std::weak_ptr<kvmem::RawKvRamPool> pool_ref;
+        std::lock_guard<std::mutex> lk(pool_mu);
+        rcfg.ram_pool = pool_ref.lock();
+        if (!rcfg.ram_pool) {
+            rcfg.ram_pool = std::make_shared<kvmem::RawKvRamPool>(cap);
+            pool_ref = rcfg.ram_pool;
+        } else if (rcfg.ram_pool->limit_bytes() != cap) {
+            throw std::runtime_error("global RAM pool budget changed while stores are live");
+        }
+    }
     if (g_kvmem_params.raw_k_nvme) {
         rcfg.nvme_bytes = g_kvmem_params.nvme_bytes
                 ? g_kvmem_params.nvme_bytes
@@ -1104,12 +1125,89 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::make_conv() {
     auto conv = std::make_unique<ConvStore>();
     conv->runtime = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_, &backend_);
     conv->raw = std::make_unique<kvmem::RawKvStore>(raw_cfg_);
+    // A newly created detached store is not the inference working set.
+    conv->raw->set_ram_pinned(false);
     conv->q_sum.assign(n_layer_, std::vector<float>(n_head_ * n_embd_head_, 0.0f));
     conv->q_count.assign(n_layer_, 0);
     if (mtp_) {
         conv->mtp_raw = mtp_->make_raw();
     }
     return conv;
+}
+
+int32_t llama_memory_kvmem::conv_missing_suffix(const ConvStore & conv) const {
+    if (!conv.runtime || !conv.raw || !conv.raw->ram_pool_enabled() ||
+        !conv.raw->ram_recoverable_eviction() || conv.cold || !block_tokens_ ||
+        (mtp_ && !conv.mtp_raw)) return -1;
+    const auto & store = conv.runtime->store();
+    const uint32_t count = store.block_count();
+    if (!count || conv.row_positions.size() < store.total_tokens()) return -1;
+    int32_t missing = -1;
+    for (uint32_t id = 0; id < count; ++id) {
+        const auto & b = store.blocks()[id];
+        if (!b.n_tokens || b.orig_pos_start != id * block_tokens_ ||
+            b.gpu_slot >= 0 || b.cpu_slot >= 0 || b.nvme_slot >= 0 ||
+            b.tier == kvmem::KvTier::GPU) return -1;
+        bool complete = true, any = false;
+        for (uint32_t il = 0; il < n_layer_; ++il) {
+            if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) continue;
+            const bool k = conv.raw->has_k_gpu(id, il, b.n_tokens);
+            const bool v = conv.raw->has_v_gpu(id, il, b.n_tokens);
+            const bool mean = conv.raw->has_mean_k(id, il, b.n_tokens);
+            any |= k || v || mean;
+            complete &= k && v && mean;
+        }
+        // Never discard an intact suffix or accept a half-written page as an
+        // eviction: those need the existing full-miss repair path.
+        if (missing >= 0) {
+            if (any) return -1;
+        } else if (!complete) {
+            if (any) return -1;
+            missing = static_cast<int32_t>(id * block_tokens_);
+        } else if (mtp_ && (!conv.mtp_raw->has_k_gpu(id, 0, b.n_tokens) ||
+                            !conv.mtp_raw->has_v_gpu(id, 0, b.n_tokens))) {
+            return -1; // draft carry requires matching prefix KV
+        }
+    }
+    return missing > 0 && static_cast<uint32_t>(missing) < store.total_tokens() ? missing : -1;
+}
+
+bool llama_memory_kvmem::conv_recover_suffix(ConvStore & conv, uint32_t keep_rows) noexcept {
+    try {
+        if (conv_missing_suffix(conv) != static_cast<int32_t>(keep_rows)) return false;
+        // Pin before checking a second time: the outgoing drain reconciles
+        // the pool, and must not evict these physical prefix pages mid-switch.
+        conv.raw->set_ram_pinned(true);
+        if (conv_missing_suffix(conv) != static_cast<int32_t>(keep_rows)) {
+            conv.raw->set_ram_pinned(false);
+            return false;
+        }
+        conv.raw->recover_evicted_suffix(keep_rows);
+        if (conv.mtp_raw) conv.mtp_raw->truncate_to(keep_rows);
+        conv.runtime->truncate_to(keep_rows);
+        conv.row_positions.resize(keep_rows);
+        conv.resident.erase(std::remove_if(conv.resident.begin(), conv.resident.end(),
+            [this, keep_rows](uint32_t id) { return id * block_tokens_ >= keep_rows; }), conv.resident.end());
+        kvmem_diag("KVMEM_TRACE store_suffix_recover rows=%u retained_blocks=%u\n",
+                keep_rows, keep_rows / block_tokens_);
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: suffix recovery refused (%s)\n", __func__, e.what());
+        // A partial truncate must never be selected as a hit. Destroy only
+        // this parked store's remaining data; attach reports a full miss.
+        try { conv.raw->clear(); conv.runtime->truncate_to(0); if (conv.mtp_raw) conv.mtp_raw->clear(); }
+        catch (...) { /* mark unusable even if runtime truncate fails */ }
+        conv.raw->mark_ram_unusable();
+        try { conv.raw->set_ram_pinned(false); } catch (...) {}
+        return false;
+    } catch (...) {
+        LLAMA_LOG_WARN("%s: suffix recovery failed with unknown exception\n", __func__);
+        try { conv.raw->clear(); conv.runtime->truncate_to(0); if (conv.mtp_raw) conv.mtp_raw->clear(); }
+        catch (...) {}
+        if (conv.raw) conv.raw->mark_ram_unusable();
+        try { if (conv.raw) conv.raw->set_ram_pinned(false); } catch (...) {}
+        return false;
+    }
 }
 
 uint32_t llama_memory_kvmem::conv_n_tokens(const ConvStore & conv) const {
@@ -1303,6 +1401,8 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::detach_conv()
         mtp_->harvest_flush();
     }
 
+    if (raw_) raw_->set_ram_pinned(false);
+
     // Nothing from here to the return may throw. Past these two moves this
     // object owns no store at all and swap_conv's drain catch cannot put them
     // back: the move-assignments are noexcept, swap_raw() only waits on the
@@ -1394,6 +1494,16 @@ bool llama_memory_kvmem::attach_conv(std::unique_ptr<ConvStore> conv) {
     if (runtime_->store().total_tokens() == 0) {
         return false;
     }
+    if (raw_->ram_evicted()) {
+        // Pool eviction discarded one or more layers of this conversation.
+        // Never attach the remaining blocks to the old checkpoint: let the
+        // server's !restaged path drop its payload and prefill this request
+        // anew, without touching other parked conversations.
+        kvmem_diag("KVMEM_TRACE store_pool_miss rows=%u\n", runtime_->store().total_tokens());
+        reset_policy();
+        if (mtp_) mtp_->clear(true);
+        return false;
+    }
 
     // write_block_to_gpu() silently skips a layer with no packed bytes, which
     // would leave live cells holding another conversation's K. This is the same
@@ -1482,6 +1592,72 @@ bool llama_memory_kvmem::attach_conv(std::unique_ptr<ConvStore> conv) {
     return true;
 }
 
+bool llama_memory_kvmem::fork_from_detached(const ConvStore & source, uint32_t keep_rows) noexcept {
+    if (!runtime_ || !raw_ || !source.runtime || !source.raw || !kv_ ||
+        !raw_->ram_pool_enabled() || !source.raw->ram_pool_enabled() ||
+        raw_->ram_evicted() || source.raw->ram_evicted() ||
+        rt_cfg_.cpu_bytes || rt_cfg_.nvme_bytes || raw_cfg_.nvme_bytes ||
+        keep_rows < block_tokens_ || block_tokens_ != 128 ||
+        keep_rows > n_slots_ * block_tokens_ ||
+        runtime_->store().total_tokens() != 0 ||
+        source.runtime->store().total_tokens() < keep_rows ||
+        source.row_positions.size() < keep_rows || (mtp_ && !source.mtp_raw)) {
+        return false;
+    }
+    try {
+        source.raw->wait_writes();
+        // The fork source was fully drained when it was parked. Never reuse
+        // either its GPU slot numbers or a tier handle owned by its runtime.
+        const auto & src_store = source.runtime->store();
+        const uint32_t nblocks = (keep_rows + block_tokens_ - 1) / block_tokens_;
+        for (uint32_t id = 0; id < nblocks; ++id) {
+            const uint32_t need = std::min(block_tokens_, keep_rows - id * block_tokens_);
+            const auto & b = src_store.blocks().at(id);
+            if (b.orig_pos_start != id * block_tokens_ || b.n_tokens < need ||
+                b.gpu_slot >= 0 || b.cpu_slot >= 0 || b.nvme_slot >= 0 ||
+                b.tier == kvmem::KvTier::GPU) return false;
+            for (uint32_t il = 0; il < n_layer_; ++il) {
+                if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) continue;
+                if (!source.raw->has_k_gpu(id, il, need) ||
+                    !source.raw->has_v_gpu(id, il, need)) return false;
+            }
+        }
+        std::vector<RowPosition> rows(source.row_positions.begin(),
+                                      source.row_positions.begin() + keep_rows);
+        source.raw->clone_prefix_shared_to(*raw_, keep_rows);
+        runtime_->register_append(keep_rows);
+        auto & dst_store = runtime_->store();
+        for (uint32_t id = 0; id < nblocks; ++id) {
+            dst_store.set_block_tier(id, kvmem::KvTier::CPU, -1, -1);
+        }
+        row_positions_ = std::move(rows);
+        // Restore a working set using the existing checked packed-K/V path;
+        // the source keeps its own immutable prefix handles and old suffix.
+        std::vector<uint32_t> selected(nblocks);
+        for (uint32_t id = 0; id < nblocks; ++id) selected[id] = id;
+        const auto plan = runtime_->prepare_selection(selected);
+        trace_plan("conv_fork", plan);
+        apply_plan_to_kv(plan);
+        for (uint32_t id : plan.stage_in) write_block_to_gpu(id);
+        kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
+        // A restored draft carry without matching follower KV is unsafe.
+        // Missing draft coverage fails the whole fork (child only), rather
+        // than silently treating the target's cache hit as a draft hit.
+        if (mtp_) mtp_->fork_prefix_from(*source.mtp_raw, keep_rows);
+        ++attention_epoch_;
+        if (store_n_tokens() != keep_rows) throw std::runtime_error("fork row count mismatch");
+        kvmem_diag("KVMEM_TRACE store_fork_adapter rows=%u blocks=%u stage_in=%zu\n",
+                   keep_rows, nblocks, plan.stage_in.size());
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: fork refused (%s), clearing child only\n", __func__, e.what());
+    } catch (...) {
+        LLAMA_LOG_WARN("%s: fork refused, clearing child only\n", __func__);
+    }
+    conv_reset_to_empty("fork");
+    return false;
+}
+
 // Best-effort return to "attached, holding nothing". Both of swap_conv's
 // repair paths call this and neither may throw out of it: the drain path
 // rethrows the drain's own exception afterwards, and the attach path runs
@@ -1564,6 +1740,10 @@ bool llama_memory_kvmem::swap_conv(std::unique_ptr<ConvStore> & conv) {
     if (!conv) {
         return false;
     }
+    // Hold the incoming mirror throughout the drain, then either attach it
+    // or unpin it on a failed drain. A missing mirror is handled as a normal
+    // cache miss by attach_conv(), not by refusing the switch.
+    if (conv->raw) conv->raw->set_ram_pinned(true);
     std::string reason;
     if (!conv_can_drain(reason)) {
         // The outgoing conversation cannot be drained safely. Discard it rather
@@ -1610,11 +1790,13 @@ bool llama_memory_kvmem::swap_conv(std::unique_ptr<ConvStore> & conv) {
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: KVMem store drain failed (%s); the active store is reset to empty\n",
                 __func__, e.what());
+        if (conv->raw) conv->raw->set_ram_pinned(false);
         conv_reset_to_empty("drain");
         throw;
     } catch (...) {
         LLAMA_LOG_ERROR("%s: KVMem store drain failed; the active store is reset to empty\n",
                 __func__);
+        if (conv->raw) conv->raw->set_ram_pinned(false);
         conv_reset_to_empty("drain");
         throw;
     }
@@ -3910,7 +4092,21 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     }
     const kvmem::KvMemBlock & blk = store.blocks()[block_id];
     if (blk.gpu_slot < 0 || !raw_->has_block(block_id)) {
+        if (raw_->ram_pool_enabled() && blk.gpu_slot >= 0 && blk.n_tokens > 0)
+            throw std::runtime_error("stage-in refused: raw KV block missing");
         return;
+    }
+    // Check the entire requested block before modifying any GPU cell. A RAM
+    // eviction has no safe stage-in fallback; never silently reuse old cells.
+    if (raw_->ram_pool_enabled()) {
+        if (raw_->ram_evicted())
+            throw std::runtime_error("stage-in refused: RAM-only KV store was evicted");
+        for (uint32_t il = 0; il < n_layer_; ++il) {
+            if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) continue;
+            if (!raw_->has_k_gpu(block_id, il, blk.n_tokens) ||
+                (!v_trans_ && !raw_->has_v_gpu(block_id, il, blk.n_tokens)))
+                throw std::runtime_error("stage-in refused: packed K/V block missing");
+        }
     }
     ++attention_epoch_;
     occupy_block_cells(block_id);
@@ -3956,9 +4152,9 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         if (retr_.enabled) {
             retr_.copy_us += ggml_time_us() - t_copy;
         }
-        if (!have_k && !have_v) {
-            continue;
-        }
+        if (raw_->ram_pool_enabled() && (!have_k || (!v_trans_ && !have_v)))
+            throw std::runtime_error("stage-in refused: packed K/V copy failed");
+        if (!have_k && !have_v) continue;
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
         ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
         uint8_t * kbase = multi_gpu_ ? nullptr : kvmem_cuda_tensor_ptr(kt);
@@ -5070,6 +5266,32 @@ bool llama_kvmem_store_switch(int32_t store_id) {
     return restaged;
 }
 
+bool llama_kvmem_store_fork_pin(int32_t source_store_id, bool pinned) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem || g_conv_pool.owner != mem) return false;
+    try {
+        if (source_store_id == g_conv_pool.active) {
+            mem->raw().set_fork_pinned(pinned);
+            return true;
+        }
+        kvmem_conv_entry * source = kvmem_conv_find(source_store_id);
+        if (!source || !source->store || source->store->cold || !source->store->raw) return false;
+        source->store->raw->set_fork_pinned(pinned);
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: fork pin failed (%s)\n", __func__, e.what());
+        return false;
+    }
+}
+
+bool llama_kvmem_store_fork_into_active(int32_t source_store_id, uint32_t keep_rows) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem || g_conv_pool.owner != mem || source_store_id == g_conv_pool.active) return false;
+    const kvmem_conv_entry * source = kvmem_conv_find(source_store_id);
+    if (!source || !source->store || source->store->cold) return false;
+    return mem->fork_from_detached(*source->store, keep_rows);
+}
+
 int32_t llama_kvmem_store_current(void) {
     llama_memory_kvmem * mem = kvmem_capture_active();
     if (!mem) {
@@ -5108,6 +5330,27 @@ uint32_t llama_kvmem_store_rows(int32_t store_id) {
     }
     const kvmem_conv_entry * e = kvmem_conv_find(store_id);
     return (e && e->store) ? mem->conv_n_tokens(*e->store) : 0;
+}
+
+int32_t llama_kvmem_store_missing_suffix(int32_t store_id) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem || g_conv_pool.owner != mem || store_id == g_conv_pool.active) return -1;
+    const auto * e = kvmem_conv_find(store_id);
+    return e && e->store ? mem->conv_missing_suffix(*e->store) : -1;
+}
+
+bool llama_kvmem_store_recover_suffix(int32_t store_id, uint32_t keep_rows) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem || g_conv_pool.owner != mem || store_id == g_conv_pool.active) return false;
+    auto * e = kvmem_conv_find(store_id);
+    return e && e->store && mem->conv_recover_suffix(*e->store, keep_rows);
+}
+
+void llama_kvmem_store_recovery_unpin(int32_t store_id) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem || g_conv_pool.owner != mem || store_id == g_conv_pool.active) return;
+    auto * e = kvmem_conv_find(store_id);
+    if (e && e->store && e->store->raw) e->store->raw->set_ram_pinned(false);
 }
 
 uint64_t llama_kvmem_store_bytes(int32_t store_id) {

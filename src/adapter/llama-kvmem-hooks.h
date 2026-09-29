@@ -125,12 +125,23 @@ LLAMA_API int32_t  llama_kvmem_store_create(void);
 // snapshot, and a match is only usable when a recurrent checkpoint exists at
 // or before it.
 LLAMA_API bool     llama_kvmem_store_switch(int32_t store_id);
+// RAM-only: fork complete shared packed-KV blocks from a detached source into
+// the currently active EMPTY store. Returns false without publishing usable
+// rows on failure; the source remains unchanged.
+LLAMA_API bool     llama_kvmem_store_fork_into_active(int32_t source_store_id, uint32_t keep_rows);
+// Protect a source across detach -> fork publication; release even on refusal.
+LLAMA_API bool     llama_kvmem_store_fork_pin(int32_t source_store_id, bool pinned);
 // Handle of the active store; 0 is the store built with the memory object.
 LLAMA_API int32_t  llama_kvmem_store_current(void);
 // Free a detached store. Refused for the active one.
 LLAMA_API bool     llama_kvmem_store_destroy(int32_t store_id);
 // Rows held by one store (llama_kvmem_store_n_tokens is the active one).
 LLAMA_API uint32_t llama_kvmem_store_rows(int32_t store_id);
+// Parked RAM-pool store only: exact contiguous missing suffix start, or -1.
+// Recovery is permitted only with an independently verified recurrent checkpoint.
+LLAMA_API int32_t  llama_kvmem_store_missing_suffix(int32_t store_id);
+LLAMA_API bool     llama_kvmem_store_recover_suffix(int32_t store_id, uint32_t keep_rows);
+LLAMA_API void     llama_kvmem_store_recovery_unpin(int32_t store_id);
 // Accounted host bytes of one store. Walks blocks times layers under the store
 // mutex: call it once per request or per status report, never per token.
 LLAMA_API uint64_t llama_kvmem_store_bytes(int32_t store_id);
