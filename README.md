@@ -12,6 +12,14 @@ llama.cpp inference with tiered KV memory for long-running agents.
 
 This port supports **Qwen3.8-27B GGUF quants**, including IQ3 and IQ4. The sibling [kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native runtime focused on Q8, primarily tested on RTX PRO 6000.
 
+## Experimental global RAM KV pool and vision weight parking
+
+This fork adds a process-local, configurable **soft budget for shared trunk KV pages** across conversations. Complete common-prefix blocks can be shared copy-on-write, including the MTP mirror; when a precisely matching recurrent checkpoint is available, a missing contiguous suffix can be replayed without rebuilding the intact prefix. This is not arbitrary content deduplication, and the byte budget is not a hard process-RSS limit (it excludes MTP mirrors, recurrent checkpoints, metadata, temporary allocations and GPU memory). The current local trial profile sets the pool budget to 16 GiB.
+
+It also includes **CUDA vision weights on demand** and optional CUDA VMM parking: vision weights are uploaded for image encoding and released afterward, while language-model weights can be temporarily parked in host RAM to make room. These paths are **not hardcoded to the V100**. The RAM pool is host-side; the vision path requires CUDA, and VMM parking additionally requires one visible CUDA device with CUDA VMM support. ROCm/HIP does not use this CUDA VMM parking path.
+
+The CUDA sm70 build and a basic text-inference smoke test have been verified on a Tesla V100-SXM2-16GB. Image-path behavior and other GPU architectures or CUDA/driver combinations need their own runtime validation; only the V100 has been exercised with this port so far. See [experimental feature details and limits](docs/experimental-global-ram-pool.md) before enabling them.
+
 The logical workspace (`-c`) can extend beyond 256K using host RAM; quality at those lengths remains experimental.
 
 The [KVMem paper](https://arxiv.org/abs/2609.04852) shows that, on queries up to 256K, keeping only a **32K GPU-resident active context** is essentially lossless versus the **full 256K** history: **LongMemEval-S** 85.6% vs 86.6% accuracy, **AgentLongBench** 60.9% vs 59.5% task success.

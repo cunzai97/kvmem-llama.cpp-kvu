@@ -4,7 +4,7 @@
 llama.cpp `v0.5.0` release (`7fe450e19305b828c199d602c23a8337aaa1f03b`).
 It includes the existing KVMem hooks, multimodal batch, MTP, media
 parser and mtmd helper extensions, plus FP32 GDN Record/Fold for ReplaySSM.
-It also fixes reasoning-budget initialization from a template's generation prefix, and includes CUDA VMM parking plus on-demand upload/release for V100 vision weights. The separate RDNA2 patch remains a distinct follow-up.
+It also fixes reasoning-budget initialization from a template's generation prefix and includes CUDA vision on-demand upload/release plus optional VMM weight parking. These paths are not V100-specific: VMM parking requires one visible CUDA device with VMM support; ROCm/HIP does not use this CUDA path. The CUDA sm70 build and basic text-inference smoke test have only been verified on a Tesla V100-SXM2-16GB; image-path and other-GPU runtime coverage remain open. The separate RDNA2 patch remains a distinct follow-up.
 `scripts/apply-patches.sh` applies it
 without creating commits and checks for an already applied tree.
 
